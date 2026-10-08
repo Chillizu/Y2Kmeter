@@ -23,9 +23,7 @@
 #include "source/ui/modules/MilkdropModule.h"
 #include "source/ui/modules/ProjectMApi.h"
 #include "source/analysis/AnalyserHub.h"
-#ifdef Y2KMETER_MILKDROP_ONLY
 #include "source/ui/MilkdropParamIds.h"
-#endif
 
 // ==========================================================
 // 屏幕尺寸模拟（仅开发调试用）
@@ -229,7 +227,7 @@ public:
         const juce::Font versionFont = PinkXP::getFont (10.0f, juce::Font::italic);
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
         const int nameW    = nameFont.getStringWidth ("Y2Kmeter");
-const int versionW = versionFont.getStringWidth ("v2.7.6");
+const int versionW = versionFont.getStringWidth ("v2.8.0");
         const int urlW     = urlFont.getStringWidth ("iisaacbeats.cn");
         constexpr int gap1 = 6;
         constexpr int gap2 = 10;
@@ -270,7 +268,7 @@ const int versionW = versionFont.getStringWidth ("v2.7.6");
     {
         // ------- 1) 顶部抬头文字：软件名 + 版本号 + 官网（低对比度，贴在底图上）-------
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.7.6";
+const juce::String versionText = "v2.8.0";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont(12.0f, juce::Font::plain);
@@ -1838,11 +1836,59 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
 
     // Milkdrop-only：无标题栏，workspace 铺满整个 Editor
     resized();
-
-    // 把从 Processor 恢复的初始状态同步到宿主参数（避免 timer 首次 pull 用
-    // 默认参数值覆盖已恢复的 Milkdrop 状态）。
-    pushMilkdropAutomationParams();
 #endif
+
+    // ==================================================================
+    // 宿主自动化参数恢复 + 双向同步（milkdrop-only 与完整版插件共用）。
+    //   仅插件宿主形态（VST3/AU）执行：Standalone 无宿主参数，auto 状态由
+    //   布局 XML 恢复、visual/wave 由 host state 顶层属性恢复，无需走 APVTS。
+    // ==================================================================
+    if (isPluginHost)
+    {
+        // 1) 先从宿主恢复的参数应用到模块：auto 状态是模块级状态，仅通过 APVTS
+        //    参数（md_auto_*）持久化，必须在此先行恢复；否则下方 push 会用模块
+        //    默认状态覆盖宿主恢复值，导致"关闭界面重开后 auto 回归默认"。
+        {
+            MilkdropModule* md = nullptr;
+            if (workspace != nullptr)
+                for (int i = 0; i < workspace->getNumModules(); ++i)
+                    if (auto* m = dynamic_cast<MilkdropModule*> (workspace->getModule (i)))
+                    { md = m; break; }
+
+            if (md != nullptr)
+            {
+                auto& apvts = processor.getApvts();
+                md->setAutoModeEnabled (apvts.getRawParameterValue (MilkdropParams::kAutoMode)->load() >= 0.5f);
+                md->setAutoBeatMode (apvts.getRawParameterValue (MilkdropParams::kAutoBeatMode)->load() >= 0.5f);
+                md->setAutoBeats (juce::roundToInt (apvts.getRawParameterValue (MilkdropParams::kAutoBeats)->load()));
+                // applyAutoInterval 内部会触发一次 push 回写参数，放最后确保此时
+                // autoMode/autoBeatMode/autoBeats 均已恢复，push 回写的是完整状态。
+                md->applyAutoInterval (apvts.getRawParameterValue (MilkdropParams::kAutoInterval)->load());
+            }
+
+            // 预设索引恢复：直接入队跳转，Editor GL 上下文就绪后消费。
+            const int presetIndex = juce::roundToInt (processor.getApvts()
+                .getRawParameterValue (MilkdropParams::kPresetIndex)->load());
+            if (presetIndex >= 0)
+                RequestMilkdropPresetJump (presetIndex);
+        }
+
+        // 2) 再把当前状态同步到宿主参数（visual/wave 从 Processor 恢复，auto 已从
+        //    参数恢复），避免 timer 首次 pull 用默认参数覆盖已恢复状态。
+        pushMilkdropAutomationParams();
+
+        // 3) 注册宿主参数监听器：宿主 automation / MIDI CC 改参数时，APVTS 可能
+        //    在音频线程回调 parameterChanged；HostParamListener 内部用 AsyncUpdater
+        //    转到消息线程高频应用视觉/wave 状态，消除 10Hz pull 采样造成的"阶梯式"
+        //    变化。auto/preset 仍由 10Hz pull 兜底（离散操作，无需高频）。
+        hostParamListener_ = std::make_unique<HostParamListener> (*this);
+        {
+            auto& apvts = processor.getApvts();
+            for (auto* p : processor.getParameters())
+                if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (p))
+                    apvts.addParameterListener (withId->getParameterID(), hostParamListener_.get());
+        }
+    }
 
     // ==================================================================
     // GPU 合成层挂载（Standalone + VST3 共用此入口）
@@ -1968,6 +2014,16 @@ Y2KmeterAudioProcessorEditor::~Y2KmeterAudioProcessorEditor()
     // P4：先解绑 Processor → Editor 的 flush 钩子，避免析构阶段里
     //   宿主线程调 getStateInformation 触发回调到已部分销毁的 this。
     processor.flushPendingUiStateBeforeSave = nullptr;
+
+    // 注销宿主参数监听器，避免 Editor 析构后 APVTS 再回调到悬垂的 this。
+    if (hostParamListener_ != nullptr)
+    {
+        auto& apvts = processor.getApvts();
+        for (auto* p : processor.getParameters())
+            if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (p))
+                apvts.removeParameterListener (withId->getParameterID(), hostParamListener_.get());
+        hostParamListener_.reset();
+    }
 
     // -1) Editor 级 GL 上下文 detach：最先解除 GPU 绑定，确保 workspace 等子组件
     //      析构时 GL 资源（Texture/VBO/FBO）已经在上下文解除后安全释放。
@@ -3412,7 +3468,7 @@ void Y2KmeterAudioProcessorEditor::paint(juce::Graphics& g)
 
         // 主标题 "Y2Kmeter"
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.7.6";
+const juce::String versionText = "v2.8.0";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont (12.0f, juce::Font::bold);
@@ -3420,7 +3476,7 @@ const juce::String versionText = "v2.7.6";
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
 
         const int nameW    = nameFont.getStringWidth (nameText);
-        const int versionW = versionFont.getStringWidth ("v2.7.6");
+        const int versionW = versionFont.getStringWidth ("v2.8.0");
         const int urlW     = urlFont.getStringWidth (urlText);
 
         constexpr int gap1 = 6;   // name ↔ version 之间
@@ -4543,6 +4599,14 @@ bool Y2KmeterAudioProcessorEditor::keyPressed(const juce::KeyPress& key) {
   // 它们内部会根据 isFloating() 正确路由到本地 GLView 或 Editor renderer；
   // 直接调 Editor 的 RequestMilkdropPreset* 在脱离态下会被挂起的 renderer 忽略。
 
+#ifdef Y2KMETER_MILKDROP_ONLY
+  // Milkdrop-only 插件变体：屏蔽 ← / → / 空格 键盘预设切换。
+  // 该变体把预设切换暴露为宿主自动化参数（MD CC / automation）驱动，
+  // 键盘控制会与宿主自动化产生冲突；完整版 Y2Kmeter（含 Standalone）仍保留。
+  juce::ignoreUnused (key);
+  return false;
+#else
+
   MilkdropModule* milk = nullptr;
   if (workspace != nullptr) {
     for (int i = 0; i < workspace->getNumModules(); ++i) {
@@ -4563,6 +4627,7 @@ bool Y2KmeterAudioProcessorEditor::keyPressed(const juce::KeyPress& key) {
   if (key == juce::KeyPress::spaceKey) { milk->randomPreset(); return true; }
 
   return false;
+#endif
 }
 
 // ==========================================================
@@ -4722,10 +4787,26 @@ void Y2KmeterAudioProcessorEditor::timerCallback()
     //   拖到另一台显示器时 Editor::moved() 不会触发，因此必须用轮询兜底。
     updateUiScaleForCurrentDisplay();
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // Milkdrop-only：10Hz 拉取宿主自动化参数 → 应用到 Milkdrop 渲染。
-    pullMilkdropAutomationParams();
+    // 10Hz 拉取宿主自动化参数 → 应用到 Milkdrop 渲染（仅插件宿主形态）。
+    if (isPluginHost)
+    {
+        pullMilkdropAutomationParams();
 
+        // 预设索引持久化：渲染索引变化时回写 md_preset_index。
+        //   · 预设切换由 GL 线程异步消费并更新渲染索引，UI 线程无法在点击时立即
+        //     拿到新索引，故在此轮询检测变化后 push；
+        //   · 不在 pull 里做反向跳转，避免与"UI 切换后回写参数"产生双向竞争。
+        {
+            const int currentIdx = GetMilkdropCurrentPresetIndex();
+            if (currentIdx >= 0 && currentIdx != lastSyncedPresetIndex_)
+            {
+                lastSyncedPresetIndex_ = currentIdx;
+                pushMilkdropAutomationParams();
+            }
+        }
+    }
+
+#ifdef Y2KMETER_MILKDROP_ONLY
     // 同步右下角 resize 斜线（ResizableCornerComponent）的可见性，使其跟随
     // Milkdrop 顶部 overlay 控制栏的显隐：控制栏自动隐藏时斜线一起隐藏，
     // hover 重新显示时斜线恢复。（用轮询兜底，覆盖 editorResized 对可见性的重置）
@@ -5717,6 +5798,11 @@ juce::String Y2KmeterAudioProcessorEditor::GetMilkdropError() const {
   return milkdrop_error_;
 }
 
+HostPlayheadSnapshot Y2KmeterAudioProcessorEditor::getHostPlayheadSnapshot()
+    const noexcept {
+  return processor.getHostPlayheadSnapshot();
+}
+
 int Y2KmeterAudioProcessorEditor::GetMilkdropCurrentPresetIndex()
     const noexcept {
   return milkdrop_current_preset_ui_.load();
@@ -5757,10 +5843,8 @@ void Y2KmeterAudioProcessorEditor::SetMilkdropVisualState(const MilkdropVisualSt
   }
   // 同步写回 Processor，作为 host state 顶层属性持久化（关闭→重开复原）。
   processor.setSavedMilkdropVisualState(state);
-#ifdef Y2KMETER_MILKDROP_ONLY
-  // UI 改了视觉状态 → 回写宿主参数，保持参数与渲染一致。
+  // UI 改了视觉状态 → 回写宿主参数，保持参数与渲染一致（Standalone 下空操作）。
   pushMilkdropAutomationParams();
-#endif
 }
 
 MilkdropVisualState Y2KmeterAudioProcessorEditor::GetMilkdropVisualState() const {
@@ -5774,10 +5858,8 @@ void Y2KmeterAudioProcessorEditor::SetMilkdropWaveState(const MilkdropWaveState&
     milkdrop_wave_state_ = state;
   }
   processor.setSavedMilkdropWaveState(state);
-#ifdef Y2KMETER_MILKDROP_ONLY
-  // UI 改了波形状态 → 回写宿主参数。
+  // UI 改了波形状态 → 回写宿主参数（Standalone 下空操作）。
   pushMilkdropAutomationParams();
-#endif
 }
 
 MilkdropWaveState Y2KmeterAudioProcessorEditor::GetMilkdropWaveState() const {
@@ -5785,9 +5867,8 @@ MilkdropWaveState Y2KmeterAudioProcessorEditor::GetMilkdropWaveState() const {
   return milkdrop_wave_state_;
 }
 
-#ifdef Y2KMETER_MILKDROP_ONLY
 // ==========================================================
-// Milkdrop-only：宿主自动化参数 ↔ Milkdrop 渲染状态 双向同步
+// 宿主自动化参数 ↔ Milkdrop 渲染状态 双向同步（插件宿主形态）
 //
 //   · pullMilkdropAutomationParams：宿主（CC/automation）→ 渲染。
 //     在 timerCallback 里 10Hz 轮询；参数值 ≠ 渲染状态 → 应用参数。
@@ -5803,19 +5884,23 @@ MilkdropWaveState Y2KmeterAudioProcessorEditor::GetMilkdropWaveState() const {
 //   · auto_mode / auto_interval：双向（宿主↔UI）。UI 修改后 MilkdropModule
 //     会调 push 回写宿主参数，pull 只在参数 ≠ 状态时把参数写进模块状态。
 //   · preset_next/prev/random：开关型，只做 off→on 上升沿触发一次动作。
+//
+//   仅插件宿主形态（isPluginHost）生效：Standalone 无宿主参数，各函数在
+//   开头直接返回，避免无意义的参数树读写。
 // ==========================================================
 
-void Y2KmeterAudioProcessorEditor::pullMilkdropAutomationParams()
+bool Y2KmeterAudioProcessorEditor::applyVisualAndWaveFromHostParams()
 {
-    pullingParams_ = true;   // 抑制 pull 过程中 SetMilkdrop*State 内部触发的 push
-    auto& apvts = processor.getApvts();
+    if (! isPluginHost)
+        return false;   // Standalone 无宿主参数，无需同步。
 
-    // 从 workspace 中找到唯一的 MilkdropModule（milkdrop-only 下只有一个）。
-    MilkdropModule* md = nullptr;
-    if (workspace != nullptr)
-        for (int i = 0; i < workspace->getNumModules(); ++i)
-            if (auto* m = dynamic_cast<MilkdropModule*> (workspace->getModule (i)))
-            { md = m; break; }
+    // 只把宿主的 color / effects / tweak / wave 参数应用到渲染状态。
+    //   · 不刷新 UI 控件（refreshStateFromEditor 由 10Hz pull 兜底）；
+    //   · 不处理 auto / preset（离散操作，10Hz pull 足够）；
+    //   · 调用方须已置 pullingParams_ = true（listener 回调 / pull 内部都会设置），
+    //     以抑制 SetMilkdrop*State 内部的 push 反向覆盖宿主参数。
+    auto& apvts = processor.getApvts();
+    bool anyChanged = false;
 
     // ---- 1. Visual state（color + effects + tweak offset）----
     {
@@ -5860,7 +5945,7 @@ void Y2KmeterAudioProcessorEditor::pullMilkdropAutomationParams()
         if (changed)
         {
             SetMilkdropVisualState (vs);
-            if (md != nullptr) md->refreshStateFromEditor();   // 刷新二级面板控件
+            anyChanged = true;
         }
     }
 
@@ -5896,20 +5981,52 @@ void Y2KmeterAudioProcessorEditor::pullMilkdropAutomationParams()
         if (changed)
         {
             SetMilkdropWaveState (ws);
-            if (md != nullptr) md->refreshStateFromEditor();   // 刷新二级面板控件
+            anyChanged = true;
         }
     }
+
+    return anyChanged;
+}
+
+void Y2KmeterAudioProcessorEditor::pullMilkdropAutomationParams()
+{
+    if (! isPluginHost)
+        return;   // Standalone 无宿主参数，无需同步。
+
+    pullingParams_ = true;   // 抑制 pull 过程中 SetMilkdrop*State 内部触发的 push
+    auto& apvts = processor.getApvts();
+
+    // 从 workspace 中找到唯一的 MilkdropModule。
+    MilkdropModule* md = nullptr;
+    if (workspace != nullptr)
+        for (int i = 0; i < workspace->getNumModules(); ++i)
+            if (auto* m = dynamic_cast<MilkdropModule*> (workspace->getModule (i)))
+            { md = m; break; }
+
+    // ---- 1+2. Visual + Wave 状态（color/effects/tweak/wave）----
+    //   复用 applyVisualAndWaveFromHostParams（listener 高频也用它），
+    //   pull 此处仅作为 10Hz 兜底 + 借机刷新二级面板控件。
+    if (applyVisualAndWaveFromHostParams() && md != nullptr)
+        md->refreshStateFromEditor();   // 刷新二级面板控件
 
     // ---- 3. Auto（模块级，双向：UI 改后 push 回写参数）----
     if (md != nullptr)
     {
         const bool autoParam = apvts.getRawParameterValue (MilkdropParams::kAutoMode)->load() >= 0.5f;
         if (autoParam != md->isAutoModeActive())
-            md->toggleAutoMode();
+            md->setAutoModeEnabled (autoParam);
 
         const float interval = apvts.getRawParameterValue (MilkdropParams::kAutoInterval)->load();
-        if (std::fabs (interval - md->getAutoIntervalSeconds()) > 1e-3f)
+        if (std::fabs (interval - md->getAutoIntervalSeconds()) > 1e-5f)
             md->applyAutoInterval (interval);
+
+        const bool beatMode = apvts.getRawParameterValue (MilkdropParams::kAutoBeatMode)->load() >= 0.5f;
+        if (beatMode != md->isAutoBeatMode())
+            md->setAutoBeatMode (beatMode);
+
+        const int beats = juce::roundToInt (apvts.getRawParameterValue (MilkdropParams::kAutoBeats)->load());
+        if (beats != md->getAutoBeats())
+            md->setAutoBeats (beats);
     }
 
     // ---- 4. 预设切换开关（宿主 off→on 触发一次，on→off 不触发）----
@@ -5927,11 +6044,19 @@ void Y2KmeterAudioProcessorEditor::pullMilkdropAutomationParams()
         lastPresetRandom_ = rnd;
     }
 
+    // 注：md_preset_index 不在此 pull（不做宿主 automation 绝对跳转），
+    //   仅用于持久化：渲染索引变化时由 timerCallback 检测并 push 回写，
+    //   初始化恢复由 Editor 构造末尾直接 RequestMilkdropPresetJump 完成。
+    //   若在此 pull 会与"UI 切换预设后 push 回写"产生双向竞争，导致
+    //   预设被跳回旧索引。
+
     pullingParams_ = false;
 }
 
 void Y2KmeterAudioProcessorEditor::pushMilkdropAutomationParams()
 {
+    if (! isPluginHost)
+        return;   // Standalone 无宿主参数，无需同步。
     if (pullingParams_) return;   // pull 期间跳过，避免用未更新状态回滚宿主参数
     auto& apvts = processor.getApvts();
 
@@ -6016,8 +6141,16 @@ void Y2KmeterAudioProcessorEditor::pushMilkdropAutomationParams()
         {
             setB (MilkdropParams::kAutoMode,     md->isAutoModeActive());
             setF (MilkdropParams::kAutoInterval, md->getAutoIntervalSeconds());
+            setB (MilkdropParams::kAutoBeatMode, md->isAutoBeatMode());
+            setI (MilkdropParams::kAutoBeats,    md->getAutoBeats());
         }
     }
+
+    // ---- 预设索引（持久化；-1 = 尚未加载，跳过以免覆盖宿主恢复值）----
+    {
+        const int idx = GetMilkdropCurrentPresetIndex();
+        if (idx >= 0)
+            setI (MilkdropParams::kPresetIndex, idx);
+    }
 }
-#endif
 

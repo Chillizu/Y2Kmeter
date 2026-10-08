@@ -1587,6 +1587,8 @@ juce::ValueTree MilkdropModule::saveModuleSpecificState() const
     s.setProperty("presetIndex", idx, nullptr);
   s.setProperty("autoMode", isAutoMode_, nullptr);
   s.setProperty("autoInterval", autoIntervalSeconds_, nullptr);
+  s.setProperty("autoBeatMode", autoModeIsBeat_, nullptr);
+  s.setProperty("autoBeats", autoBeats_, nullptr);
   return s;
 }
 
@@ -1597,15 +1599,42 @@ void MilkdropModule::restoreModuleSpecificState(const juce::ValueTree& state)
     int idx = static_cast<int>(state.getProperty("presetIndex"));
     // 范围校验由 newOpenGLContextCreated 负责（此时 presetPaths 可能还未扫描）
     if (idx >= 0)
+    {
       restored_preset_index_ = idx;
+#if !JUCE_MAC
+      // 嵌入态（Windows）由 Editor 全局 projectM 渲染：restore 时直接入队跳转
+      // 请求，Editor 的 newOpenGLContextCreated 会在 GL 上下文就绪后消费该请求
+      // 加载对应预设（对齐 Standalone 4.5 的恢复路径）。macOS 嵌入态走 GLView
+      // 本地渲染，由 GLView::newOpenGLContextCreated 读 restored_preset_index_ 恢复，
+      // 无需此跳转。越界由消费端（Editor newOpenGLContextCreated）兜底为 0。
+      if (editor_ != nullptr)
+        editor_->RequestMilkdropPresetJump(idx);
+#endif
+    }
   }
   if (state.hasProperty("autoMode"))
+  {
     isAutoMode_ = static_cast<bool>(state.getProperty("autoMode"));
+    // 恢复 auto 开关状态时同步展开时间控制条，保持与手动开启 auto 时一致的表现。
+    isAutoRowExpanded_ = isAutoMode_;
+  }
   if (state.hasProperty("autoInterval"))
   {
     autoIntervalSeconds_ = juce::jlimit(kMinAutoInterval, kMaxAutoInterval,
                                         static_cast<float>(state.getProperty("autoInterval")));
   }
+  if (state.hasProperty("autoBeatMode"))
+    autoModeIsBeat_ = static_cast<bool>(state.getProperty("autoBeatMode"));
+  if (state.hasProperty("autoBeats"))
+  {
+    autoBeats_ = juce::jlimit(kMinAutoBeats, kMaxAutoBeats,
+                              static_cast<int>(state.getProperty("autoBeats")));
+  }
+  // Standalone（无宿主 playhead）下 BPM 同步模式不可用，回退时间模式。
+  //   覆盖旧存档（无 autoBeatMode 字段，默认 beat）在 Standalone 下恢复后
+  //   auto 开启却无法切换的边界情况。
+  if (autoModeIsBeat_ && !isHostPlayheadAvailable())
+    autoModeIsBeat_ = false;
 }
 
 juce::Rectangle<int> MilkdropModule::GetContentLocalBounds() const {
@@ -1741,7 +1770,7 @@ void MilkdropModule::paintContent(juce::Graphics& g, juce::Rectangle<int> conten
     auto topBar = content.withHeight(26);
     paintOverlayControlBar(g, topBar);
     paintLibraryButtons(g, content);
-    if (isAutoMode_)
+    if (isAutoRowExpanded_)
       paintAutoControlRow(g, topBar);
     if (isColorPanelOpen_)
       paintColorPanel(g, topBar);
@@ -1874,7 +1903,7 @@ void MilkdropModule::GLView::paint(juce::Graphics& g) {
       -static_cast<float>(offset.getY())));
   owner_.paintOverlayControlBar(g, content);
   owner_.paintLibraryButtons(g, content);
-  if (owner_.isAutoModeActive())
+  if (owner_.isAutoRowExpanded_)
     owner_.paintAutoControlRow(g, content.withHeight(26));
   if (owner_.isColorPanelOpen_)
     owner_.paintColorPanel(g, content.withHeight(26));
@@ -2837,11 +2866,23 @@ void MilkdropModule::mouseDown(const juce::MouseEvent& e)
     }
 
     // ---- auto 行 slider 拖动检测（必须在基类之前，避免基类启动拖拽状态） ----
-    if (isAutoMode_ && glView != nullptr && !isDraggingSlider_)
+    if (isAutoRowExpanded_ && glView != nullptr && !isDraggingSlider_)
     {
         auto content = getContentBounds();
         auto topBar = content.withHeight(26);
         auto autoRow = getAutoRowBounds(topBar);
+
+        // ---- 模式切换按钮点击（sec ↔ beat，仅插件宿主模式） ----
+        if (!cachedAutoModeBtnRect_.isEmpty() &&
+            cachedAutoModeBtnRect_.contains(e.getPosition()))
+        {
+            if (!focused_)
+                setFocusVisual(true);
+            touchOverlayIdleTimer();
+            toggleAutoModeType();
+            return;
+        }
+
         auto sliderBounds = getSliderBounds(autoRow);
         if (sliderBounds.expanded(4).contains(e.getPosition()))
         {
@@ -2851,13 +2892,16 @@ void MilkdropModule::mouseDown(const juce::MouseEvent& e)
             touchOverlayIdleTimer();
             float proportion = static_cast<float>(e.getPosition().x - sliderBounds.getX())
                                / static_cast<float>(sliderBounds.getWidth());
-            updateAutoIntervalFromSlider(proportion);
+            if (autoModeIsBeat_)
+                updateAutoBeatsFromSlider(proportion);
+            else
+                updateAutoIntervalFromSlider(proportion);
             repaint(autoRow);
             glView->repaint();
             return;  // 不调用基类，避免 ModulePanel::mouseDown 启动标题栏/边缘拖拽
         }
-        // ---- auto 行时间标签点击检测（弹出间隔输入对话框） ----
-        if (cachedAutoTimeLabel_.contains(e.getPosition()))
+        // ---- 时间标签点击检测（仅时间模式弹出间隔输入对话框） ----
+        if (!autoModeIsBeat_ && cachedAutoTimeLabel_.contains(e.getPosition()))
         {
             if (!focused_)
                 setFocusVisual(true);
@@ -3130,11 +3174,9 @@ void MilkdropModule::mouseUp(const juce::MouseEvent& e)
     if (isDraggingSlider_)
     {
         isDraggingSlider_ = false;
-#ifdef Y2KMETER_MILKDROP_ONLY
         // 拖动结束提交：把 auto_interval 回写宿主参数，避免 10Hz pull 反向覆盖。
         if (editor_ != nullptr)
             editor_->pushMilkdropAutomationParams();
-#endif
         repaint();
         glView->repaint();
         return;
@@ -3224,7 +3266,10 @@ void MilkdropModule::mouseMove(const juce::MouseEvent& e)
         auto sliderBounds = getSliderBounds(autoRow);
         float proportion = static_cast<float>(e.getPosition().x - sliderBounds.getX())
                            / static_cast<float>(sliderBounds.getWidth());
-        updateAutoIntervalFromSlider(proportion);
+        if (autoModeIsBeat_)
+            updateAutoBeatsFromSlider(proportion);
+        else
+            updateAutoIntervalFromSlider(proportion);
         repaint(autoRow);
         glView->repaint();
         return;
@@ -3344,8 +3389,18 @@ void MilkdropModule::mouseMove(const juce::MouseEvent& e)
             else
                 setMouseCursor(juce::MouseCursor::PointingHandCursor);
         }
-        else if (isAutoMode_ && cachedAutoTimeLabel_.contains(e.getPosition()))
+        else if (isAutoRowExpanded_ &&
+                 (!cachedAutoModeBtnRect_.isEmpty() &&
+                  cachedAutoModeBtnRect_.contains(e.getPosition())))
         {
+            // auto 模式切换按钮 hover（sec ↔ beat）
+            touchOverlayIdleTimer();
+            setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        }
+        else if (isAutoRowExpanded_ && !autoModeIsBeat_ &&
+                 cachedAutoTimeLabel_.contains(e.getPosition()))
+        {
+            // 时间标签 hover（仅时间模式可点击弹框）
             touchOverlayIdleTimer();
             setMouseCursor(juce::MouseCursor::PointingHandCursor);
         }
@@ -3375,7 +3430,10 @@ void MilkdropModule::mouseDrag(const juce::MouseEvent& e)
         auto sliderBounds = getSliderBounds(autoRow);
         float proportion = static_cast<float>(e.getPosition().x - sliderBounds.getX())
                            / static_cast<float>(sliderBounds.getWidth());
-        updateAutoIntervalFromSlider(proportion);
+        if (autoModeIsBeat_)
+            updateAutoBeatsFromSlider(proportion);
+        else
+            updateAutoIntervalFromSlider(proportion);
         repaint(autoRow);
         glView->repaint();
         return;
@@ -4444,7 +4502,7 @@ void MilkdropModule::OverlayView::paint(juce::Graphics& g)
 
     owner_.paintOverlayControlBar(g, moduleTopBar);
     owner_.paintLibraryButtons(g, owner_.getContentBounds());
-    if (owner_.isAutoMode_)
+    if (owner_.isAutoRowExpanded_)
         owner_.paintAutoControlRow(g, moduleTopBar);
     if (owner_.isColorPanelOpen_)
         owner_.paintColorPanel(g, moduleTopBar);
@@ -4474,7 +4532,7 @@ void MilkdropModule::UpdateOverlayViewPlacement()
 
     // 计算控制栏在屏幕坐标下的矩形。
     // - 顶部第一行（overlay control bar）：内容区顶部 26px。
-    // - 若启用 auto 模式，额外向下扩展 kAutoRowHeight 供第二行绘制。
+    // - 若 auto 时间控制条展开，额外向下扩展 kAutoRowHeight 供第二行绘制。
     auto contentLocal = GetContentLocalBounds();
     if (contentLocal.isEmpty())
     {
@@ -4485,7 +4543,7 @@ void MilkdropModule::UpdateOverlayViewPlacement()
     }
 
     int barH = 26;
-    if (isAutoMode_)
+    if (isAutoRowExpanded_)
         barH += static_cast<int>(kAutoRowHeight);
 
     // 展开的二级面板（color/effects/wave/tweak）绘制在控制栏正下方，
@@ -4556,23 +4614,76 @@ void MilkdropModule::UpdateOverlayViewPlacement()
 
 void MilkdropModule::toggleAutoMode()
 {
-  isAutoMode_ = !isAutoMode_;
-  if (isAutoMode_)
+  if (!isAutoMode_)
   {
-    // 与整体染色控制器互斥，避免两块控制器重叠遮挡。
-    if (isColorPanelOpen_)
-      isColorPanelOpen_ = false;
+    // 开启 auto：进入自动轮播 + 展开时间控制条，收起其它面板。
+    isAutoMode_ = true;
+    isAutoRowExpanded_ = true;
+    // Standalone（无宿主 playhead）下 BPM 同步模式不可用，回退到时间模式。
+    if (autoModeIsBeat_ && !isHostPlayheadAvailable())
+        autoModeIsBeat_ = false;
+    if (isColorPanelOpen_)    isColorPanelOpen_ = false;
+    if (isEffectsPanelOpen_)  isEffectsPanelOpen_ = false;
+    if (isWavePanelOpen_)     isWavePanelOpen_ = false;
+    if (isTweakPanelOpen_)    isTweakPanelOpen_ = false;
     lastAutoSwitchTime_ = juce::Time::getMillisecondCounter();
+    beatBucketInitialized_ = false;  // 开启 auto 时重置拍桶基准，从当前拍位重新对齐
+  }
+  else if (!isAutoRowExpanded_)
+  {
+    // auto 已开启但控制条被其它面板收起：重新展开控制条并收起其它面板，
+    // 不关闭 auto 轮播开关（互斥只影响展开面板，不影响 auto 模式）。
+    isAutoRowExpanded_ = true;
+    if (isColorPanelOpen_)    isColorPanelOpen_ = false;
+    if (isEffectsPanelOpen_)  isEffectsPanelOpen_ = false;
+    if (isWavePanelOpen_)     isWavePanelOpen_ = false;
+    if (isTweakPanelOpen_)    isTweakPanelOpen_ = false;
+  }
+  else
+  {
+    // auto 已开启且控制条展开：关闭 auto + 收起控制条。
+    isAutoMode_ = false;
+    isAutoRowExpanded_ = false;
   }
   // 重新布局并重绘
   layoutContent(getContentBounds());
   repaint();
   glView->repaint();
-#ifdef Y2KMETER_MILKDROP_ONLY
   // UI 修改 auto 状态 → 回写宿主参数，避免 10Hz pull 反向覆盖。
   if (editor_ != nullptr)
     editor_->pushMilkdropAutomationParams();
-#endif
+}
+
+void MilkdropModule::setAutoModeEnabled(bool enabled)
+{
+  if (enabled)
+  {
+    // 开启 auto：进入自动轮播 + 展开时间控制条，收起其它面板。
+    // 若开关已开启（仅控制条被其它面板收起），不重置轮播计时器。
+    if (!isAutoMode_)
+    {
+      isAutoMode_ = true;
+      // Standalone（无宿主 playhead）下 BPM 同步模式不可用，回退到时间模式。
+      if (autoModeIsBeat_ && !isHostPlayheadAvailable())
+          autoModeIsBeat_ = false;
+      lastAutoSwitchTime_ = juce::Time::getMillisecondCounter();
+      beatBucketInitialized_ = false;  // 开启 auto 时重置拍桶基准
+    }
+    isAutoRowExpanded_ = true;
+    if (isColorPanelOpen_)    isColorPanelOpen_ = false;
+    if (isEffectsPanelOpen_)  isEffectsPanelOpen_ = false;
+    if (isWavePanelOpen_)     isWavePanelOpen_ = false;
+    if (isTweakPanelOpen_)    isTweakPanelOpen_ = false;
+  }
+  else
+  {
+    // 关闭 auto：关闭轮播开关 + 收起控制条。
+    isAutoMode_ = false;
+    isAutoRowExpanded_ = false;
+  }
+  layoutContent(getContentBounds());
+  repaint();
+  glView->repaint();
 }
 
 void MilkdropModule::checkAutoMode()
@@ -4580,6 +4691,46 @@ void MilkdropModule::checkAutoMode()
   if (!isAutoMode_)
     return;
 
+  if (autoModeIsBeat_)
+  {
+    // ----------------------------------------------------------------
+    // BPM 同步模式：对齐宿主拍网格，每 N 拍切换一次。
+    //   · 无播放信息 / 宿主未播放 / BPM 未知 / 拍数非法 → 不切换；
+    //   · 用 floor(ppq / N) 作为"拍桶"，跨过桶边界即切换，切换点对齐
+    //     到 ppq 的 N 整数倍（即宿主拍网格）；
+    //   · 播放跳回（seek / loop）时重置基准，不触发误切换。
+    // ----------------------------------------------------------------
+    if (editor_ == nullptr)
+      return;
+
+    const auto snap = editor_->getHostPlayheadSnapshot();
+    if (! snap.valid || ! snap.isPlaying)
+      return;
+    if (snap.bpm <= 0.0 || autoBeats_ <= 0)
+      return;
+
+    const double bucket = std::floor (snap.ppqPosition / static_cast<double> (autoBeats_));
+    if (! beatBucketInitialized_)
+    {
+      lastBeatBucket_ = bucket;
+      beatBucketInitialized_ = true;
+      return;
+    }
+
+    if (bucket > lastBeatBucket_)
+    {
+      lastBeatBucket_ = bucket;
+      randomPreset();
+    }
+    else if (bucket < lastBeatBucket_)
+    {
+      // 播放位置回退（宿主 seek / loop），重置基准，不触发切换。
+      lastBeatBucket_ = bucket;
+    }
+    return;
+  }
+
+  // 时间模式（原有逻辑）
   juce::uint32 now = juce::Time::getMillisecondCounter();
   juce::uint32 intervalMs = static_cast<juce::uint32>(autoIntervalSeconds_ * 1000.0f);
   if (now - lastAutoSwitchTime_ >= intervalMs)
@@ -4599,11 +4750,9 @@ void MilkdropModule::applyAutoInterval(float seconds)
   lastAutoSwitchTime_ = juce::Time::getMillisecondCounter();
   repaint();
   glView->repaint();
-#ifdef Y2KMETER_MILKDROP_ONLY
   // UI 修改 auto 间隔 → 回写宿主参数，避免 10Hz pull 反向覆盖。
   if (editor_ != nullptr)
     editor_->pushMilkdropAutomationParams();
-#endif
 }
 
 void MilkdropModule::updateAutoIntervalFromSlider(float proportion)
@@ -4619,12 +4768,68 @@ void MilkdropModule::updateAutoIntervalFromSlider(float proportion)
   {
     autoIntervalSeconds_ = seconds;
     // 不重置计时器：用户拖动期间不触发自动切换
-#ifdef Y2KMETER_MILKDROP_ONLY
     // 拖动过程中实时回写宿主参数，避免 10Hz pull 用旧参数把值覆盖回去。
     if (editor_ != nullptr)
       editor_->pushMilkdropAutomationParams();
-#endif
   }
+}
+
+void MilkdropModule::updateAutoBeatsFromSlider(float proportion)
+{
+  proportion = juce::jlimit(0.0f, 1.0f, proportion);
+  int beats = kMinAutoBeats
+              + juce::roundToInt(proportion * (kMaxAutoBeats - kMinAutoBeats));
+  beats = juce::jlimit(kMinAutoBeats, kMaxAutoBeats, beats);
+
+  if (beats != autoBeats_)
+  {
+    autoBeats_ = beats;
+    // 拍数变化后重置拍桶基准，避免用旧基准误触发切换。
+    beatBucketInitialized_ = false;
+    // 拖动过程中实时回写宿主参数，避免 10Hz pull 用旧参数把值覆盖回去。
+    if (editor_ != nullptr)
+      editor_->pushMilkdropAutomationParams();
+  }
+}
+
+void MilkdropModule::toggleAutoModeType()
+{
+  // 仅插件宿主模式可切换到 BPM 同步模式（Standalone 无 playhead）。
+  if (! isHostPlayheadAvailable())
+    return;
+
+  autoModeIsBeat_ = !autoModeIsBeat_;
+  // 切换模式后重置拍桶基准，避免用旧基准误触发切换。
+  beatBucketInitialized_ = false;
+  lastBeatBucket_ = 0.0;
+
+  repaint();
+  glView->repaint();
+  // UI 修改 auto 模式类型 → 回写宿主参数。
+  if (editor_ != nullptr)
+    editor_->pushMilkdropAutomationParams();
+}
+
+void MilkdropModule::setAutoBeatMode(bool beatMode)
+{
+  if (autoModeIsBeat_ == beatMode)
+    return;
+  autoModeIsBeat_ = beatMode;
+  beatBucketInitialized_ = false;
+  lastBeatBucket_ = 0.0;
+  repaint();
+  glView->repaint();
+}
+
+void MilkdropModule::setAutoBeats(int beats)
+{
+  beats = juce::jlimit(kMinAutoBeats, kMaxAutoBeats, beats);
+  if (autoBeats_ == beats)
+    return;
+  autoBeats_ = beats;
+  beatBucketInitialized_ = false;
+  repaint();
+  glView->repaint();
 }
 
 juce::Rectangle<int> MilkdropModule::getAutoRowBounds(juce::Rectangle<int> topBar) const
@@ -4633,12 +4838,35 @@ juce::Rectangle<int> MilkdropModule::getAutoRowBounds(juce::Rectangle<int> topBa
                               topBar.getWidth(), kAutoRowHeight);
 }
 
+bool MilkdropModule::isHostPlayheadAvailable() const
+{
+  // 仅插件宿主模式（VST3/AU 等）能拿到宿主播放位置；Standalone 无 playhead，
+  // 按用户需求隐藏 BPM 模式入口，只保留时间模式。
+  return editor_ != nullptr && editor_->isPluginHostMode();
+}
+
+juce::Rectangle<int> MilkdropModule::getAutoModeBtnBounds(juce::Rectangle<int> autoRow) const
+{
+  // Standalone（无宿主 playhead）返回空矩形 → 不绘制模式按钮，隐藏 BPM 入口。
+  if (! isHostPlayheadAvailable())
+    return {};
+
+  constexpr int kModeBtnW = 42;
+  constexpr int kModeBtnH = 20;
+  return juce::Rectangle<int>(autoRow.getX() + 6,
+                              autoRow.getY() + (autoRow.getHeight() - kModeBtnH) / 2,
+                              kModeBtnW, kModeBtnH);
+}
+
 juce::Rectangle<int> MilkdropModule::getSliderBounds(juce::Rectangle<int> autoRow) const
 {
   constexpr int kSliderPadR = 44;
   constexpr int kSliderH = 8;
-  // 布局: "Auto:"(x+6, 38px) + gap(4px) + slider
-  int sliderX = autoRow.getX() + 6 + 38 + 4;
+  int sliderX;
+  if (isHostPlayheadAvailable())
+    sliderX = autoRow.getX() + 6 + 42 + 6;  // 模式按钮(42px) + gap
+  else
+    sliderX = autoRow.getX() + 6 + 38 + 4;  // "Auto:" 标签(38px) + gap
   int sliderW = autoRow.getWidth() - sliderX - kSliderPadR;
   return juce::Rectangle<int>(sliderX,
                               autoRow.getY() + (autoRow.getHeight() - kSliderH) / 2,
@@ -4657,16 +4885,42 @@ void MilkdropModule::paintAutoControlRow(juce::Graphics& g, juce::Rectangle<int>
   g.setColour(PinkXP::pink300.withAlpha(0.5f));
   g.fillRect(autoRow.getX(), autoRow.getBottom(), autoRow.getWidth(), 1);
 
-  // "Auto:" 标签（左侧）
-  g.setColour(PinkXP::pink300.withAlpha(0.95f));
-  g.setFont(PinkXP::getFont(9.0f, juce::Font::bold));
-  g.drawText("Auto:", autoRow.getX() + 6, autoRow.getY(),
-             38, autoRow.getHeight(), juce::Justification::centredLeft, false);
+  const auto mousePos = getMouseXYRelative();
+
+  // ---- 左侧：模式切换按钮（sec / beat）或 "Auto:" 标签 ----
+  auto modeBtn = getAutoModeBtnBounds(autoRow);
+  cachedAutoModeBtnRect_ = modeBtn;  // 供 hit-test（Standalone 下为空矩形）
+  if (! modeBtn.isEmpty())
+  {
+    // 插件宿主模式：绘制可点击的模式切换按钮（时间 ↔ BPM）
+    const bool hovered = modeBtn.contains (mousePos);
+    g.setColour (hovered
+        ? juce::Colour (0xFF, 0xFF, 0xFF).withAlpha (0.16f)
+        : juce::Colour (0xFF, 0xFF, 0xFF).withAlpha (0.08f));
+    g.fillRoundedRectangle (modeBtn.toFloat(), 3.0f);
+    g.setColour (PinkXP::pink300.withAlpha (hovered ? 1.0f : 0.8f));
+    g.drawRoundedRectangle (modeBtn.toFloat().reduced (0.5f, 0.5f), 3.0f, 1.0f);
+
+    g.setColour (autoModeIsBeat_ ? PinkXP::pink300 : juce::Colour (0xDD, 0xDD, 0xDD));
+    g.setFont (PinkXP::getFont (9.0f, juce::Font::bold));
+    g.drawText (autoModeIsBeat_ ? "beat" : "sec", modeBtn, juce::Justification::centred, false);
+  }
+  else
+  {
+    // Standalone（无宿主 playhead）：只保留时间模式标签，隐藏 BPM 入口
+    g.setColour (PinkXP::pink300.withAlpha (0.95f));
+    g.setFont (PinkXP::getFont (9.0f, juce::Font::bold));
+    g.drawText ("Auto:", autoRow.getX() + 6, autoRow.getY(),
+                38, autoRow.getHeight(), juce::Justification::centredLeft, false);
+  }
 
   // ---- Slider 轨道与滑块 ----
   auto sliderBounds = getSliderBounds(autoRow);
-  float proportion = static_cast<float>(autoIntervalSeconds_ - kMinAutoInterval)
-                     / static_cast<float>(kMaxAutoInterval - kMinAutoInterval);
+  const float proportion = autoModeIsBeat_
+      ? static_cast<float> (autoBeats_ - kMinAutoBeats)
+        / static_cast<float> (kMaxAutoBeats - kMinAutoBeats)
+      : static_cast<float> (autoIntervalSeconds_ - kMinAutoInterval)
+        / static_cast<float> (kMaxAutoInterval - kMinAutoInterval);
 
   // 轨道底色
   g.setColour(juce::Colour(0xFF, 0xFF, 0xFF).withAlpha(0.18f));
@@ -4693,38 +4947,44 @@ void MilkdropModule::paintAutoControlRow(juce::Graphics& g, juce::Rectangle<int>
   g.setColour(PinkXP::pink600);
   g.drawRect(knobBounds, 1);
 
-  // 右侧时间标签（如 "10.000s"、"1m30.000s"）—— 可点击弹出输入对话框
-  juce::String timeLabel;
-  if (autoIntervalSeconds_ >= 60.0f)
+  // ---- 右侧数值标签 ----
+  //   时间模式：如 "10.000s" / "1m30.000s"（可点击弹输入框）；
+  //   BPM 模式：如 "4 beat"（仅滑块调节，标签不可点击）。
+  juce::String valueLabel;
+  if (autoModeIsBeat_)
+  {
+    valueLabel = juce::String (autoBeats_) + " beat";
+  }
+  else if (autoIntervalSeconds_ >= 60.0f)
   {
     int mins = static_cast<int>(autoIntervalSeconds_) / 60;
     float secs = std::fmod(autoIntervalSeconds_, 60.0f);
-    timeLabel = juce::String(mins) + "m";
+    valueLabel = juce::String(mins) + "m";
     if (secs > 0.05f)
-      timeLabel += juce::String(secs, 3) + "s";
+      valueLabel += juce::String(secs, 3) + "s";
   }
   else
   {
-    timeLabel = juce::String(autoIntervalSeconds_, 3) + "s";
+    valueLabel = juce::String(autoIntervalSeconds_, 3) + "s";
   }
 
-  auto timeLabelRect = juce::Rectangle<int>(
+  auto valueLabelRect = juce::Rectangle<int>(
       sliderBounds.getRight() + 4, autoRow.getY(),
       40, autoRow.getHeight());
-  cachedAutoTimeLabel_ = timeLabelRect;  // 供 mouseDown/mouseMove hit-test
+  cachedAutoTimeLabel_ = valueLabelRect;  // 供 mouseDown/mouseMove hit-test
 
-  // hover 时微亮底色，提示可点击
-  bool timeHovered = timeLabelRect.contains(
-      getMouseXYRelative() - juce::Point<int>(0, 0));
-  if (timeHovered)
+  // 时间模式下标签可点击 → hover 微亮底色提示可点击
+  const bool labelClickable = ! autoModeIsBeat_;
+  bool labelHovered = labelClickable && valueLabelRect.contains (mousePos);
+  if (labelHovered)
   {
     g.setColour(juce::Colour(0xFF, 0xFF, 0xFF).withAlpha(0.08f));
-    g.fillRoundedRectangle(timeLabelRect.toFloat().reduced(2, 4), 2.0f);
+    g.fillRoundedRectangle(valueLabelRect.toFloat().reduced(2, 4), 2.0f);
   }
 
-  g.setColour(PinkXP::pink300.withAlpha(timeHovered ? 1.0f : 0.9f));
+  g.setColour(PinkXP::pink300.withAlpha(labelHovered ? 1.0f : 0.9f));
   g.setFont(PinkXP::getFont(8.0f, juce::Font::plain));
-  g.drawText(timeLabel, timeLabelRect, juce::Justification::centredLeft, false);
+  g.drawText(valueLabel, valueLabelRect, juce::Justification::centredLeft, false);
 }
 
 // ==========================================================
@@ -4735,9 +4995,10 @@ void MilkdropModule::toggleColorPanel()
   isColorPanelOpen_ = !isColorPanelOpen_;
   if (isColorPanelOpen_)
   {
-    // 与自动轮播 / 效果 / 波形 / 偏移面板互斥，避免控制器重叠遮挡。
-    if (isAutoMode_)
-      isAutoMode_ = false;
+    // 与 auto 时间控制条 / 效果 / 波形 / 偏移面板互斥，避免控制器重叠遮挡。
+    // 只收起 auto 控制条，不关闭 auto 轮播开关。
+    if (isAutoRowExpanded_)
+      isAutoRowExpanded_ = false;
     if (isEffectsPanelOpen_)
       isEffectsPanelOpen_ = false;
     if (isWavePanelOpen_)
@@ -4758,9 +5019,10 @@ void MilkdropModule::toggleEffectsPanel()
   isEffectsPanelOpen_ = !isEffectsPanelOpen_;
   if (isEffectsPanelOpen_)
   {
-    // 与自动轮播 / 染色 / 波形 / 偏移面板互斥，避免控制器重叠遮挡。
-    if (isAutoMode_)
-      isAutoMode_ = false;
+    // 与 auto 时间控制条 / 染色 / 波形 / 偏移面板互斥，避免控制器重叠遮挡。
+    // 只收起 auto 控制条，不关闭 auto 轮播开关。
+    if (isAutoRowExpanded_)
+      isAutoRowExpanded_ = false;
     if (isColorPanelOpen_)
       isColorPanelOpen_ = false;
     if (isWavePanelOpen_)
@@ -4780,9 +5042,10 @@ void MilkdropModule::toggleWavePanel()
   isWavePanelOpen_ = !isWavePanelOpen_;
   if (isWavePanelOpen_)
   {
-    // 与自动轮播 / 染色 / 效果 / 偏移面板互斥，避免控制器重叠遮挡。
-    if (isAutoMode_)
-      isAutoMode_ = false;
+    // 与 auto 时间控制条 / 染色 / 效果 / 偏移面板互斥，避免控制器重叠遮挡。
+    // 只收起 auto 控制条，不关闭 auto 轮播开关。
+    if (isAutoRowExpanded_)
+      isAutoRowExpanded_ = false;
     if (isColorPanelOpen_)
       isColorPanelOpen_ = false;
     if (isEffectsPanelOpen_)
@@ -4803,9 +5066,10 @@ void MilkdropModule::toggleTweakPanel()
   isTweakPanelOpen_ = !isTweakPanelOpen_;
   if (isTweakPanelOpen_)
   {
-    // 与自动轮播 / 染色 / 效果 / 波形面板互斥，避免控制器重叠遮挡。
-    if (isAutoMode_)
-      isAutoMode_ = false;
+    // 与 auto 时间控制条 / 染色 / 效果 / 波形面板互斥，避免控制器重叠遮挡。
+    // 只收起 auto 控制条，不关闭 auto 轮播开关。
+    if (isAutoRowExpanded_)
+      isAutoRowExpanded_ = false;
     if (isColorPanelOpen_)
       isColorPanelOpen_ = false;
     if (isEffectsPanelOpen_)

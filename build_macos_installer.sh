@@ -27,7 +27,7 @@
 #   chmod +x build_macos_installer.sh
 #   ./build_macos_installer.sh                        # 完整打包（ad-hoc 签名）
 #   ./build_macos_installer.sh --no-sign              # 跳过签名
-#   ./build_macos_installer.sh --version 2.7.6        # 覆盖版本号
+#   ./build_macos_installer.sh --version 2.8.0        # 覆盖版本号
 #   ./build_macos_installer.sh --skip-plugins         # 只打 Standalone + milkdrop
 #   ./build_macos_installer.sh --skip-milkdrop        # 只打 Standalone + 完整版插件
 #   ./build_macos_installer.sh --identity "Developer ID Application: ... (TEAMID)"

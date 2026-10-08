@@ -94,12 +94,10 @@ public:
     void SetMilkdropWaveState(const MilkdropWaveState& state);
     MilkdropWaveState GetMilkdropWaveState() const;
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // Milkdrop-only：把当前渲染状态（visual/wave/auto）回写到宿主参数。
+    // 把当前渲染状态（visual/wave/auto）回写到宿主参数。
     //   public 供 MilkdropModule 在 UI 修改 auto 轮播状态后调用，使宿主参数
-    //   跟随 UI 状态，避免 10Hz pull 反向覆盖。详见 .cpp。
+    //   跟随 UI 状态，避免 10Hz pull 反向覆盖。Standalone 下为空操作。详见 .cpp。
     void pushMilkdropAutomationParams();
-#endif
 
     Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcessor&);
     ~Y2KmeterAudioProcessorEditor() override;
@@ -182,6 +180,13 @@ public:
     // 返回用户选择的 FPS 限制档位（30/60/120/0，0=无上限）
     int  GetUserRequestedFpsLimit() const noexcept { return userRequestedFpsLimit; }
 
+    // 是否插件宿主模式（VST3/AU 等，宿主提供 playhead）；Standalone 返回 false。
+    //   · Milkdrop BPM 同步自动切换模式仅在此为 true 时显示入口。
+    bool isPluginHostMode() const noexcept { return isPluginHost; }
+
+    // 转发 Processor 的宿主播放位置快照（供 Milkdrop BPM 同步模式读取）。
+    HostPlayheadSnapshot getHostPlayheadSnapshot() const noexcept;
+
 private:
     // 初始化字体、LookAndFeel、ModuleWorkspace
     void initLookAndFeel();
@@ -240,12 +245,17 @@ private:
     void updateUiScaleForCurrentDisplay();
     void moved() override;
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // ---- Milkdrop-only：宿主自动化参数双向同步（pull：宿主 → 渲染）----
+    // ---- 宿主自动化参数双向同步（pull：宿主 → 渲染）----
     //   在 timerCallback 里以 10Hz 轮询，检测参数变化并应用到 Milkdrop 状态。
-    //   （push 已移到 public 区，供 MilkdropModule 修改 auto 后回写宿主参数。）
+    //   仅插件宿主形态生效（Standalone 无宿主参数，直接返回）。详见 .cpp。
     void pullMilkdropAutomationParams();
-#endif
+
+    // 只把宿主的 color/effects/tweak/wave 参数应用到渲染状态（不含 auto/preset、
+    // 不刷新 UI 控件）。由参数 listener 在宿主改动参数时立即调用，避免 10Hz
+    // pull 采样造成的"阶梯式"视觉变化（手动拖动是逐事件高频，宿主 automation
+    // 则是逐音频块高频，10Hz 采样会漏掉中间值）。
+    // 返回是否有状态发生变化（供 10Hz pull 据此决定是否 refreshStateFromEditor）。
+    bool applyVisualAndWaveFromHostParams();
 
     void handleCloseClicked();
     void handlePinClicked();       // 切换 alwaysOnTop
@@ -324,7 +334,6 @@ private:
 
     Y2KmeterAudioProcessor& processor;
 
-#ifdef Y2KMETER_MILKDROP_ONLY
     // pull 期间置位，抑制 SetMilkdropVisualState 内部触发的 push，
     // 避免 pull 中途用"尚未更新的状态"回滚宿主刚写入的参数。
     bool pullingParams_ = false;
@@ -332,7 +341,35 @@ private:
     bool lastPresetNext_   = false;
     bool lastPresetPrev_   = false;
     bool lastPresetRandom_ = false;
-#endif
+    // 上一次已回写到 md_preset_index 的渲染索引（-1 = 尚未同步）。
+    //   timerCallback 检测渲染索引变化 → push 回写参数（持久化当前预设）。
+    int lastSyncedPresetIndex_ = -1;
+
+    // 宿主参数变化监听器：宿主（automation/MIDI CC）改参数时，APVTS 可能在**音频
+    // 线程**回调 parameterChanged（VST3 宿主在音频线程 setNormalized）。这里用
+    // AsyncUpdater 把工作转到消息线程（触发即合并，每帧最多一次），既消除 10Hz
+    // pull 采样造成的阶梯，又避免在音频线程触碰 UI / 非原子状态。
+    class HostParamListener : public juce::AudioProcessorValueTreeState::Listener,
+                              private juce::AsyncUpdater
+    {
+    public:
+        explicit HostParamListener (Y2KmeterAudioProcessorEditor& e) : editor_ (e) {}
+        ~HostParamListener() override { cancelPendingUpdate(); }
+        void parameterChanged (const juce::String&, float) override
+        {
+            triggerAsyncUpdate();
+        }
+        void handleAsyncUpdate() override
+        {
+            const bool wasPulling = editor_.pullingParams_;
+            editor_.pullingParams_ = true;
+            editor_.applyVisualAndWaveFromHostParams();
+            editor_.pullingParams_ = wasPulling;
+        }
+    private:
+        Y2KmeterAudioProcessorEditor& editor_;
+    };
+    std::unique_ptr<HostParamListener> hostParamListener_;
 
     // true = 被 DAW 宿主加载的插件模式（VST3 / AU / AAX / LV2 等）；
     // false = Standalone 模式。

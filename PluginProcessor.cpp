@@ -97,12 +97,12 @@ Y2KmeterAudioProcessor::Y2KmeterAudioProcessor()
         });
     }
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // Milkdrop-only：创建宿主自动化参数树。
-    // APVTS 构造函数内部会 addParameterGroup 到 *this，宿主即可枚举并自动化。
+    // 创建宿主自动化参数树（milkdrop-only 与完整版插件共用）。
+    // APVTS 构造函数内部会 addParameterGroup 到 *this，宿主即可枚举并自动化；
+    // Standalone 无宿主枚举，但参数树仍用于完整版插件添加 Milkdrop 模块后的
+    // 参数持久化（auto 状态 / 预设索引等），无副作用。
     apvts = std::make_unique<juce::AudioProcessorValueTreeState>(
         *this, nullptr, "Y2KmeterMilkdropParams", MilkdropParams::createLayout());
-#endif
 }
 
 Y2KmeterAudioProcessor::~Y2KmeterAudioProcessor() {}
@@ -165,6 +165,43 @@ void Y2KmeterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                                            buffer.getNumSamples());
 
     juce::ScopedNoDenormals noDenormals;
+
+    // ------------------------------------------------------------------
+    // 宿主播放位置缓存（供 Milkdrop BPM 同步自动切换模式读取）。
+    //   · 必须在音频线程（processBlock）里调用 getPlayHead()，其它线程调用
+    //     undefined behaviour；
+    //   · Standalone 形态 getPlayHead() 返回 nullptr → valid 保持 false；
+    //   · 位置信息缺失（如宿主不报告 BPM / ppq）时对应字段置 0，切换逻辑
+    //     会据此跳过。
+    // ------------------------------------------------------------------
+    {
+        if (auto* ph = getPlayHead())
+        {
+            if (const auto pos = ph->getPosition())
+            {
+                hostPlayheadValid.store (true, std::memory_order_relaxed);
+                hostPlayheadPlaying.store (pos->getIsPlaying(), std::memory_order_relaxed);
+
+                if (const auto bpm = pos->getBpm())
+                    hostPlayheadBpm.store (*bpm, std::memory_order_relaxed);
+                else
+                    hostPlayheadBpm.store (0.0, std::memory_order_relaxed);
+
+                if (const auto ppq = pos->getPpqPosition())
+                    hostPlayheadPpq.store (*ppq, std::memory_order_relaxed);
+                else
+                    hostPlayheadPpq.store (0.0, std::memory_order_relaxed);
+            }
+            else
+            {
+                hostPlayheadValid.store (false, std::memory_order_relaxed);
+            }
+        }
+        else
+        {
+            hostPlayheadValid.store (false, std::memory_order_relaxed);
+        }
+    }
 
     // 前置增益变化后，在音频线程安全重置 loudness（含 LUFS-I 积分）
     if (pendingLoudnessReset.exchange (false, std::memory_order_relaxed))
@@ -284,6 +321,16 @@ void Y2KmeterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 AnalyserHub& Y2KmeterAudioProcessor::getAnalyserHub() noexcept
 {
     return *analyserHub;
+}
+
+HostPlayheadSnapshot Y2KmeterAudioProcessor::getHostPlayheadSnapshot() const noexcept
+{
+    HostPlayheadSnapshot s;
+    s.valid       = hostPlayheadValid.load (std::memory_order_relaxed);
+    s.isPlaying   = hostPlayheadPlaying.load (std::memory_order_relaxed);
+    s.bpm         = hostPlayheadBpm.load (std::memory_order_relaxed);
+    s.ppqPosition = hostPlayheadPpq.load (std::memory_order_relaxed);
+    return s;
 }
 
 void Y2KmeterAudioProcessor::setAnalysisActive(bool shouldBeActive) noexcept
@@ -421,11 +468,7 @@ const juce::String Y2KmeterAudioProcessor::getName() const
 }
 bool Y2KmeterAudioProcessor::acceptsMidi() const
 {
-#ifdef Y2KMETER_MILKDROP_ONLY
-    return true;   // milkdrop-only 接入宿主 MIDI CC / automation
-#else
-    return false;
-#endif
+    return true;   // 接入宿主 MIDI CC / automation（milkdrop-only 与完整版插件一致）
 }
 bool Y2KmeterAudioProcessor::producesMidi() const { return false; }
 bool Y2KmeterAudioProcessor::isMidiEffect() const { return false; }
@@ -551,11 +594,9 @@ void Y2KmeterAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
         }
     }
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // Milkdrop-only：把参数树 state 作为 <Y2KmeterMilkdropParams> 子节点嵌入，随宿主工程持久化。
+    // 把参数树 state 作为 <Y2KmeterMilkdropParams> 子节点嵌入，随宿主工程持久化。
     if (apvts != nullptr)
         root.appendChild (apvts->copyState(), nullptr);
-#endif
 
     if (auto xml = root.createXml())
         juce::AudioProcessor::copyXmlToBinary(*xml, destData);
@@ -569,15 +610,13 @@ void Y2KmeterAudioProcessor::setStateInformation(const void* data, int sizeInByt
     const auto root = juce::ValueTree::fromXml(*xml);
     if (! root.isValid() || ! root.hasType("PBEQ_State")) return;
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // Milkdrop-only：恢复参数树 state（旧存档缺失时保持默认值）。
+    // 恢复参数树 state（旧存档缺失时保持默认值）。
     if (apvts != nullptr)
     {
         const auto paramsState = root.getChildWithName (apvts->state.getType());
         if (paramsState.isValid())
             apvts->replaceState (paramsState);
     }
-#endif
 
     if (root.hasProperty ("analysisInputGainDb"))
         setAnalysisInputGainDb ((float) (double) root.getProperty ("analysisInputGainDb", 0.0));

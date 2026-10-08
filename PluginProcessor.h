@@ -5,13 +5,26 @@
 
 #include "source/ui/modules/MilkdropVisualState.h"
 #include "source/ui/modules/MilkdropWaveState.h"
-#ifdef Y2KMETER_MILKDROP_ONLY
 #include "source/ui/MilkdropParamIds.h"
-#endif
 
 // 前向声明（AnalyserHub 的完整头下沉到 .cpp，规避 MSVC 多文件同进程编译时
 // include guard 跨 TU 串扰问题）
 class AnalyserHub;
+
+// ==========================================================
+// HostPlayheadSnapshot —— 宿主播放位置快照（音频线程写，UI 线程读）
+//
+//   由 processBlock 在每个音频块开头从 AudioPlayHead 读取并缓存到
+//   原子字段，供 Milkdrop 模块的 BPM 同步自动切换模式在 UI 线程
+//   轮询读取（无跨线程锁）。
+// ==========================================================
+struct HostPlayheadSnapshot
+{
+    bool   valid       = false;  // 是否有可用的播放位置信息（无 playhead / 宿主未报告时为 false）
+    bool   isPlaying   = false;  // 宿主是否正在播放
+    double bpm         = 0.0;    // 当前 BPM（0 = 未知）
+    double ppqPosition = 0.0;    // 当前播放位置（四分音符）
+};
 
 // ==========================================================
 // Y2KmeterAudioProcessor
@@ -168,6 +181,11 @@ public:
         return savedMilkdropUseLikeLibrary_.load();
     }
 
+    // ---- 宿主播放位置快照（供 Milkdrop BPM 同步模式读取）----
+    //   · 返回 processBlock 最近一次从 AudioPlayHead 缓存的播放信息；
+    //   · UI 线程调用，读原子字段，无锁安全。
+    HostPlayheadSnapshot getHostPlayheadSnapshot() const noexcept;
+
     // ---- 兼容旧接口（供 EqModule 使用，内部转发到 AnalyserHub）----
     double getCurrentSampleRate() const noexcept;
     void getOscilloscopeSnapshot(juce::Array<float>& dest);   // 返回 L 声道
@@ -175,12 +193,11 @@ public:
 
     bool bypassed = false;
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // ---- Milkdrop-only：宿主自动化参数树 ----
+    // ---- 宿主自动化参数树（milkdrop-only 与完整版插件共用）----
     // 暴露 Milkdrop 渲染参数（color/effects/wave/tweak/auto + 预设切换开关），
-    // 供宿主通过 MIDI CC / automation 控制。完整版 Y2Kmeter 不包含此接口。
+    // 供宿主通过 MIDI CC / automation 控制。所有形态都创建参数树：插件宿主
+    // 可枚举并自动化，Standalone 无宿主枚举但无副作用（仍用于参数持久化）。
     juce::AudioProcessorValueTreeState& getApvts() noexcept { return *apvts; }
-#endif
 
 private:
     // pimpl：头里只用前向声明的指针，完整类型只在 .cpp 中可见
@@ -216,6 +233,14 @@ private:
     // 用 atomic 消除 GL 线程（删空回退）与 UI/host 线程之间的读写竞争。
     std::atomic<bool> savedMilkdropUseLikeLibrary_ { false };
 
+    // ---- 宿主播放位置缓存（音频线程写，UI 线程读，原子无锁）----
+    //   · processBlock 每个音频块开头从 AudioPlayHead 读取并缓存；
+    //   · Standalone 形态无 playhead，valid 恒为 false。
+    std::atomic<bool>   hostPlayheadValid   { false };
+    std::atomic<bool>   hostPlayheadPlaying { false };
+    std::atomic<double> hostPlayheadBpm     { 0.0 };
+    std::atomic<double> hostPlayheadPpq     { 0.0 };
+
     // processBlock 时间占比测量器（JUCE 内置，读写原子，实时线程友好）
     juce::AudioProcessLoadMeasurer loadMeasurer;
 
@@ -242,10 +267,8 @@ private:
     juce::HeapBlock<float>   analysisGainBufferMono;
     int                      analysisGainBufferMonoCapacity = 0;
 
-#ifdef Y2KMETER_MILKDROP_ONLY
-    // Milkdrop-only：宿主自动化参数树（用 unique_ptr 延迟构造，APVTS 需绑定 *this）。
+    // 宿主自动化参数树（用 unique_ptr 延迟构造，APVTS 需绑定 *this）。
     std::unique_ptr<juce::AudioProcessorValueTreeState> apvts;
-#endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(Y2KmeterAudioProcessor)
 };

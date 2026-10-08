@@ -3679,4 +3679,48 @@ Milkdrop 脱离态由 `GLView` 自己的本地 OpenGL 线程驱动渲染。切�
 
 ---
 
+## v2.8.0：Milkdrop 宿主自动化增强 + 功能同步到完整版插件
+
+本章记录 v2.8.0 版本相对 v2.7.6 的改动：为 Milkdrop 的 auto 功能新增 BPM 同步切换模式、修复 auto 控制条与各二级面板的互斥 bug、将宿主自动化参数精度提升到 4 位小数，并把 milkdrop-only 的宿主自动化能力同步到完整版插件（完整版添加 Milkdrop 模块后同样可用）。
+
+### 1. milkdrop-only 屏蔽键盘切预设
+
+- `Y2Kmeter_milkdrop` 变体下 `keyPressed` 直接返回 `false`，`←/→/空格` 不再触发预设切换（避免与宿主自动化参数冲突）；完整版（含 Standalone）仍保留键盘切预设。
+
+### 2. auto 控制条与二级面板互斥修复
+
+- 将原 `isAutoMode_` 拆为两个语义：`isAutoMode_`（auto 轮播开关）+ `isAutoRowExpanded_`（时间控制条展开状态）。
+- 修复：展开 auto 时间控制条时收起 color/effects/wave/tweak 面板；反之展开任一二级面板只收起 auto 控制条、**不关闭 auto 轮播**。
+- `toggleAutoMode()` 改为三态（开→展开→关）；宿主自动化明确设置开关用新增的 `setAutoModeEnabled()`。
+
+### 3. BPM 同步自动切换模式
+
+- 插件形态（完整版插件 + milkdrop-only）的 auto 新增 **beat 模式**：对齐宿主拍网格，每 1~64 拍切换一次预设；宿主未播放 / 无 BPM / 无播放位置时不切换。
+- `processBlock` 在音频线程从 `AudioPlayHead` 缓存 `HostPlayheadSnapshot`（valid/isPlaying/bpm/ppqPosition），UI 线程原子无锁读取。
+- 用 `floor(ppq / N)` 作「拍桶」检测跨桶切换，seek/loop 回退时重置基准不误切。
+- Standalone（无 playhead）隐藏 BPM 模式入口，只保留时间模式。
+- auto 控制条左侧新增「sec / beat」模式切换按钮，滑块按模式映射到时间或拍数。
+
+### 4. 宿主自动化参数精度 4 位小数
+
+- `AudioParameterFloat` 简写构造默认 `interval = 0.01`，导致宿主端只能以 0.01 步长调节。改为显式 `NormalisableRange<float>(min, max, 0.0001f)`，宿主 automation / MIDI CC 可以 0.0001 步长控制，参数显示 4 位小数。
+
+### 5. milkdrop-only 定制功能同步到完整版插件
+
+- 宿主自动化参数树（`apvts`）、`acceptsMidi()`、双向同步（`pull/pushMilkdropAutomationParams`、`HostParamListener`）、参数树 state 持久化：由 `#ifdef Y2KMETER_MILKDROP_ONLY` 改为所有形态编译。
+- 用运行时 `isPluginHost`（= `wrapperType != Standalone`）判断：插件宿主形态才启用参数同步，Standalone 保持原行为（键盘切预设、BPM 入口隐藏、auto 走布局 XML 持久化）。
+- 结果：完整版 `Y2Kmeter` 插件添加 Milkdrop 模块后，color/38 fx/wave/tweak/auto/preset 全部可被宿主 automation / MIDI CC 驱动，auto 状态与当前预设索引随宿主工程持久化。
+
+### 6. 版本号
+
+- 2.7.6 → 2.8.0（`CMakeLists.txt` 三处 / `Y2Kmeter_installer.iss` / `PluginEditor.cpp` 四处字面量 / `build_macos_installer.sh` 注释）。
+
+### 踩坑记录
+
+1. **`AudioParameterFloat` 简写构造硬编码 interval=0.01**：JUCE 的 `(id, name, min, max, def)` 构造内部用 `NormalisableRange(min, max, 0.01f)`，导致宿主端 0.01 步长；需改用完整构造显式指定 interval 才能细粒度控制。
+2. **参数同步与 Standalone 的边界**：milkdrop-only 的宿主自动化能力原被编译宏隔离，同步到完整版时必须用运行时 `isPluginHost` 判断而非直接去宏，否则 Standalone（无宿主）会误走参数树读写 / 注册无用监听器。
+3. **互斥语义与开关语义解耦**：auto 面板互斥只应影响「面板展开」，不应关闭「auto 轮播开关」，需把二者拆成独立布尔量，否则展开任一二级面板会意外停掉 auto。
+
+---
+
 *本文档随着代码演进需要同步更新；若你（AI）在会话中发现文档描述与代码不一致，请以代码为准，并提示用户可能需要同步更新本文。*

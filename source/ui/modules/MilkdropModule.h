@@ -220,8 +220,15 @@ public:
     // === 自动轮播模式 ===
     bool isAutoModeActive() const noexcept { return isAutoMode_; }
     float getAutoIntervalSeconds() const noexcept { return autoIntervalSeconds_; }
-    void toggleAutoMode();
+    void toggleAutoMode();                       ///< UI 按钮：三态循环（开→展开→关）
+    void setAutoModeEnabled(bool enabled);       ///< 宿主自动化：明确设置 auto 开关状态
     void applyAutoInterval(float seconds);  // 供宿主自动化直接设置轮播间隔
+
+    // === BPM 同步自动切换（宿主播放位置驱动）===
+    bool isAutoBeatMode() const noexcept { return autoModeIsBeat_; }   ///< 是否 BPM 同步模式
+    int  getAutoBeats() const noexcept { return autoBeats_; }          ///< 每 N 拍切换
+    void setAutoBeatMode(bool beatMode);       ///< 宿主自动化：设置 BPM / 时间模式
+    void setAutoBeats(int beats);              ///< 宿主自动化：设置拍数（1~64）
     // 宿主自动化 pull 修改 Editor 全局状态后，刷新本地缓存与二级面板控件。
     void refreshStateFromEditor();
     void mouseDown(const juce::MouseEvent& e) override;
@@ -482,8 +489,12 @@ private:
     void showAutoIntervalDialog();  ///< 弹出自动轮播间隔输入对话框
     void paintAutoControlRow(juce::Graphics& g, juce::Rectangle<int> topBar);
     juce::Rectangle<int> getAutoRowBounds(juce::Rectangle<int> topBar) const;
+    juce::Rectangle<int> getAutoModeBtnBounds(juce::Rectangle<int> autoRow) const;
     juce::Rectangle<int> getSliderBounds(juce::Rectangle<int> autoRow) const;
     void updateAutoIntervalFromSlider(float proportion);
+    void updateAutoBeatsFromSlider(float proportion);
+    void toggleAutoModeType();      ///< 在 时间模式 / BPM 同步模式 之间切换（UI 按钮）
+    bool isHostPlayheadAvailable() const;  ///< 是否插件宿主模式（有 playhead 才有 BPM 入口）
 
     // ---- 整体染色控制（color 按钮 + RGB/Bright 控制器）----
     void toggleColorPanel();                                            ///< 展开/收起染色控制器
@@ -542,17 +553,27 @@ private:
     juce::uint32 lastInteractionTime_ { 0 };
 
     // ---- 自动轮播模式 ----
-    bool isAutoMode_ { false };
+    bool isAutoMode_ { false };          ///< 自动轮播开关（控制 checkAutoMode 是否工作）
+    bool isAutoRowExpanded_ { false };   ///< auto 控制条展开状态（与 color/effects/wave/tweak 面板互斥）
     float autoIntervalSeconds_ { 10.0f };
     juce::uint32 lastAutoSwitchTime_ { 0 };
     bool isDraggingSlider_ { false };
-    juce::Rectangle<int> cachedAutoTimeLabel_;  ///< 缓存 auto 行时间标签区域，供 hit-test 使用
+    juce::Rectangle<int> cachedAutoTimeLabel_;  ///< 缓存 auto 行数值标签区域，供 hit-test 使用
+    juce::Rectangle<int> cachedAutoModeBtnRect_; ///< 缓存 auto 行模式切换按钮区域，供 hit-test 使用
+
+    // ---- BPM 同步自动切换（宿主播放位置驱动，每 N 拍对齐切换一次）----
+    bool autoModeIsBeat_ { true };       ///< true = BPM 同步模式；false = 时间模式（默认 beat）
+    int  autoBeats_ { 4 };               ///< BPM 模式每 N 拍切换（1~64，默认 4）
+    bool   beatBucketInitialized_ { false }; ///< 拍桶基准是否已初始化（对齐宿主拍网格）
+    double lastBeatBucket_ { 0.0 };      ///< 上一次采样到的拍桶（floor(ppq / N)）
 
     static constexpr float kAutoRowHeight = 28.0f;
     static constexpr int   kAutoBtnW = 32;
     static constexpr int   kResBtnW  = 32;  // [1:n] 渲染缩放按钮
     static constexpr float kMinAutoInterval = 1.0f;
     static constexpr float kMaxAutoInterval = 60.0f;
+    static constexpr int   kMinAutoBeats = 1;
+    static constexpr int   kMaxAutoBeats = 64;
 
     // ---- 整体视觉状态（master output colors + effects + tweak uv 畸变）----
     MilkdropVisualState visualState_;          ///< 本地缓存：完整视觉状态（含 offset）

@@ -11,7 +11,7 @@
 //
 // 将 Milkdrop 模块控制区的所有可参数化功能暴露为宿主可见参数
 // （VST3/AU 参数 + 可被宿主 MIDI CC / automation 驱动）。
-//   · 仅 Y2KMETER_MILKDROP_ONLY 编译目标使用，完整版 Y2Kmeter 不包含。
+//   · milkdrop-only 与完整版插件共用（完整版添加 Milkdrop 模块后同样可自动化）；
 //   · 参数 ID 统一命名，供 PluginProcessor 创建布局与 PluginEditor 双向同步。
 //
 // 参数分组：
@@ -64,11 +64,15 @@ namespace MilkdropParams
     // ---- auto ----
     inline constexpr const char* kAutoMode     = "md_auto_mode";
     inline constexpr const char* kAutoInterval = "md_auto_interval";
+    inline constexpr const char* kAutoBeatMode = "md_auto_beat_mode";
+    inline constexpr const char* kAutoBeats    = "md_auto_beats";
 
     // ---- 预设切换开关（宿主 off→on 触发一次：下一个/上一个/随机）----
     inline constexpr const char* kPresetNext   = "md_preset_next";
     inline constexpr const char* kPresetPrev   = "md_preset_prev";
     inline constexpr const char* kPresetRandom = "md_preset_random";
+    // 当前预设索引（持久化用；宿主可直接 automation 跳转到指定预设）
+    inline constexpr const char* kPresetIndex  = "md_preset_index";
 
     // 效果参数的 ID（"md_fx_" + display_name）
     inline juce::String fxId (const MilkdropEffectDef& def)
@@ -88,16 +92,32 @@ namespace MilkdropParams
         return nullptr;
     }
 
+    // 创建 float 宿主参数（interval = 0.0001，即保留 4 位小数）。
+    //   · JUCE 的 AudioParameterFloat 简写构造 (id, name, min, max, def) 内部
+    //     默认 interval = 0.01，宿主端会据此把参数离散为 0.01 步长（并量化到
+    //     2 位小数），自动化控制不够细腻；
+    //   · 这里显式指定 interval = 0.0001，让宿主 automation 能以 0.0001 步长
+    //     调节，且 getText() 显示 4 位小数。
+    inline std::unique_ptr<juce::AudioParameterFloat> makeFloatParam (const char* id,
+                                                                      const char* name,
+                                                                      float minV, float maxV, float def)
+    {
+        return std::make_unique<juce::AudioParameterFloat> (
+            id, name,
+            juce::NormalisableRange<float> (minV, maxV, 0.0001f),
+            def);
+    }
+
     // 创建完整参数布局（color + effects + wave + tweak + auto + 预设切换开关）。
     inline juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
     {
         juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
         // ---- color ----
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTintR,      "Tint R",      0.0f, 2.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTintG,      "Tint G",      0.0f, 2.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTintB,      "Tint B",      0.0f, 2.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kBrightness, "Brightness",  0.0f, 8.0f, 1.0f));
+        layout.add (makeFloatParam (kTintR,      "Tint R",      0.0f, 2.0f, 1.0f));
+        layout.add (makeFloatParam (kTintG,      "Tint G",      0.0f, 2.0f, 1.0f));
+        layout.add (makeFloatParam (kTintB,      "Tint B",      0.0f, 2.0f, 1.0f));
+        layout.add (makeFloatParam (kBrightness, "Brightness",  0.0f, 8.0f, 1.0f));
 
         // ---- effects（注册表驱动）----
         for (const auto& def : GetMilkdropEffectDefs())
@@ -107,38 +127,44 @@ namespace MilkdropParams
         // ---- wave ----
         layout.add (std::make_unique<juce::AudioParameterBool>  (kWaveEnabled,  "Wave Enabled",  false));
         layout.add (std::make_unique<juce::AudioParameterInt>   (kWaveMode,     "Wave Mode",     0, 15, 6));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveX,        "Wave X",        0.0f, 1.0f, 0.5f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveY,        "Wave Y",        0.0f, 1.0f, 0.5f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveR,        "Wave R",        0.0f, 1.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveG,        "Wave G",        0.0f, 1.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveB,        "Wave B",        0.0f, 1.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveA,        "Wave Alpha",    0.0f, 1.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kWaveMystery,  "Wave Mystery", -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kWaveX,        "Wave X",        0.0f, 1.0f, 0.5f));
+        layout.add (makeFloatParam (kWaveY,        "Wave Y",        0.0f, 1.0f, 0.5f));
+        layout.add (makeFloatParam (kWaveR,        "Wave R",        0.0f, 1.0f, 1.0f));
+        layout.add (makeFloatParam (kWaveG,        "Wave G",        0.0f, 1.0f, 1.0f));
+        layout.add (makeFloatParam (kWaveB,        "Wave B",        0.0f, 1.0f, 1.0f));
+        layout.add (makeFloatParam (kWaveA,        "Wave Alpha",    0.0f, 1.0f, 1.0f));
+        layout.add (makeFloatParam (kWaveMystery,  "Wave Mystery", -1.0f, 1.0f, 0.0f));
         layout.add (std::make_unique<juce::AudioParameterBool>  (kWaveDots,     "Wave Dots",     false));
         layout.add (std::make_unique<juce::AudioParameterBool>  (kWaveThick,    "Wave Thick",    false));
         layout.add (std::make_unique<juce::AudioParameterBool>  (kWaveAdditive, "Wave Additive", false));
         layout.add (std::make_unique<juce::AudioParameterBool>  (kWaveBrighten, "Wave Brighten", false));
 
         // ---- tweak ----
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakZoom,   "Tweak Zoom",  -0.3f, 1.0f, 0.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakRot,    "Tweak Rot",   -1.0f, 1.0f, 0.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakWarp,   "Tweak Warp",  -1.0f, 1.0f, 0.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakDx,     "Tweak DX",    -1.0f, 1.0f, 0.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakDy,     "Tweak DY",    -1.0f, 1.0f, 0.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakSx,     "Tweak SX",    -1.0f, 1.0f, 0.0f));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kTweakSy,     "Tweak SY",    -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakZoom,   "Tweak Zoom",  -0.3f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakRot,    "Tweak Rot",   -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakWarp,   "Tweak Warp",  -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakDx,     "Tweak DX",    -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakDy,     "Tweak DY",    -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakSx,     "Tweak SX",    -1.0f, 1.0f, 0.0f));
+        layout.add (makeFloatParam (kTweakSy,     "Tweak SY",    -1.0f, 1.0f, 0.0f));
         layout.add (std::make_unique<juce::AudioParameterInt>   (kTweakKaleido, "Tweak Kaleido", 0, 16, 0));
         layout.add (std::make_unique<juce::AudioParameterInt>   (kTweakFoldX,   "Tweak Fold X",  0, 16, 0));
         layout.add (std::make_unique<juce::AudioParameterInt>   (kTweakFoldY,   "Tweak Fold Y",  0, 16, 0));
 
         // ---- auto ----
         layout.add (std::make_unique<juce::AudioParameterBool>  (kAutoMode,     "Auto Mode",     false));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (kAutoInterval, "Auto Interval", 1.0f, 60.0f, 10.0f));
+        layout.add (makeFloatParam (kAutoInterval, "Auto Interval", 1.0f, 60.0f, 10.0f));
+        layout.add (std::make_unique<juce::AudioParameterBool>  (kAutoBeatMode, "Auto Beat Mode", true));
+        layout.add (std::make_unique<juce::AudioParameterInt>   (kAutoBeats,    "Auto Beats",    1, 64, 4));
 
         // ---- 预设切换开关（宿主 off→on 触发一次）----
         layout.add (std::make_unique<juce::AudioParameterBool> (kPresetNext,   "Preset Next",   false));
         layout.add (std::make_unique<juce::AudioParameterBool> (kPresetPrev,   "Preset Prev",   false));
         layout.add (std::make_unique<juce::AudioParameterBool> (kPresetRandom, "Preset Random", false));
+        // 当前预设索引（持久化；宿主可 automation 跳转）。
+        // 范围上限保守取 4095：预设集 1114 个足够，同时避免 AudioParameterInt
+        // getNumSteps 过大（100000 级）给部分宿主参数枚举带来兼容性负担。
+        layout.add (std::make_unique<juce::AudioParameterInt>  (kPresetIndex,  "Preset Index",  0, 4095, 0));
 
         return layout;
     }
