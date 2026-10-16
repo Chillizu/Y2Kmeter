@@ -479,6 +479,25 @@ public:
                                        float fMin,
                                        float fMax);
 
+    // ======================================================
+    // 重分配谱图（频率重分配 / reassigned spectrogram）——
+    //   推荐 Spectrogram 的 Sharp / Sharper 模式使用。
+    //
+    //   与 getSpectrumMagnitudesBlended 相同的对数频率轴，但能量按
+    //   "瞬时频率"重定位（相位差法，phase-vocoder 风格）：
+    //     ω̂_k = ω_k + Δφ_k / hopTime,  Δφ_k = arg(X_k · conj(X_prev,k))
+    //   把每个 bin 的能量 |X_k|² 从"bin 中心频率"搬到"瞬时频率"，
+    //   落到对应对数行 —— 产生"能量凝聚成粒子"的效果（对比原始谱图
+    //   因频谱泄漏导致的"脏热点"）。
+    //
+    //   注意：当前仅用主路（2048 FFT）复频谱，覆盖全频段；
+    //   低频段分辨率受主路 Δf≈23Hz 限制。低频路（8192）重分配可作为后续增强。
+    // ======================================================
+    void getSpectrumReassignedBlended (juce::Array<float>& dest,
+                                       int   numPoints,
+                                       float fMin,
+                                       float fMax);
+
     // 响度：返回当前 LoudnessMeter 快照
     LoudnessMeter::Snapshot getLoudnessSnapshot();
 
@@ -553,6 +572,20 @@ private:
     std::array<float, fftSizeLo * 2> fftDataLo {};
     std::array<float, spectrumMagSizeLo> magDataLo {};
     std::array<float, spectrumMagSizeLo> magDataLoWork {};
+    // 低频路复频谱（供重分配谱图：8192 FFT、75% overlap、hop=2048）
+    //   低频路 hop 相对 binHz 是 ±2 bin 的无折叠范围，能覆盖 Hann 主瓣，
+    //   重分配才不会像主路（非重叠，±0.5 bin）那样产生大量折叠伪影。
+    std::array<float, spectrumMagSizeLo> specReLo     {};
+    std::array<float, spectrumMagSizeLo> specImLo     {};
+    std::array<float, spectrumMagSizeLo> prevSpecReLo {};
+    std::array<float, spectrumMagSizeLo> prevSpecImLo {};
+    std::array<float, spectrumMagSizeLo> specReLoWork {};
+    std::array<float, spectrumMagSizeLo> specImLoWork {};
+    // 音频线程私有的"帧对"：一个音频块可能触发 ≥2 次 FFT，发布时若只滚一次
+    // 会跳帧（帧对时间差 ≠ hop，瞬时频率系数就错了）。提取新帧时先把旧
+    // workCur 挪到 workPrev，保证发布出去的 prev/current 永远相邻。
+    std::array<float, spectrumMagSizeLo> specReLoWorkPrev {};
+    std::array<float, spectrumMagSizeLo> specImLoWorkPrev {};
     int fftFifoIndexLo = 0;
 
     // ---- 响度计 ----

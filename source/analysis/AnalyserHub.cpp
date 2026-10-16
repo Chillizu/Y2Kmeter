@@ -516,21 +516,26 @@ void AnalyserHub::pushSamplesToSpectrum(const float* left, const float* right, i
 
         if (fftFifoIndex >= fftSize)
         {
-            // 执行 FFT
+            // 执行 FFT（RealOnly：保留 re/im，供重分配谱图）
             std::fill(fftData.begin(), fftData.end(), 0.0f);
             std::copy(fftFifo.begin(), fftFifo.end(), fftData.begin());
             window.multiplyWithWindowingTable(fftData.data(), fftSize);
-            fft.performFrequencyOnlyForwardTransform(fftData.data());
+            fft.performRealOnlyForwardTransform(fftData.data(), true);
 
             const int maxBin = fftSize / 2;
 
-            // 1) 拷贝高精度幅度数组（供 SpectrumModule 使用）
-            //    将幅度归一化到 [0,1]（用 FFT 大小归一 + 汉宁窗补偿）
-            //    简化做法：除以 fftSize/2 作为粗略归一化，后续 UI 自己转 dB
+            // 1) 拷贝高精度幅度（供 SpectrumModule / 像素 EQ）
+            //    RealOnly(onlyNonNegative=true) 输出 maxBin+1 个复数、re/im 交错：
+            //    fftData[2k]=re[k]、fftData[2k+1]=im[k]。
+            //    归一化 2/fftSize（与原 FrequencyOnly 一致），后续 UI 自己转 dB。
             {
                 const float invMax = 2.0f / static_cast<float> (fftSize);
                 for (int iBin = 0; iBin < maxBin; ++iBin)
-                    magDataWork[static_cast<size_t> (iBin)] = fftData[static_cast<size_t> (iBin)] * invMax;
+                {
+                    const float re = fftData[static_cast<size_t> (2 * iBin)];
+                    const float im = fftData[static_cast<size_t> (2 * iBin + 1)];
+                    magDataWork[static_cast<size_t> (iBin)] = std::sqrt (re * re + im * im) * invMax;
+                }
             }
 
             // 2) 像素 EQ 用的粗粒度平滑频谱（保留原有逻辑）
@@ -541,7 +546,11 @@ void AnalyserHub::pushSamplesToSpectrum(const float* left, const float* right, i
                 const int   fBin  = juce::jlimit(0, maxBin - 1,
                                         static_cast<int> (std::round(skew * static_cast<float> (maxBin - 1))));
 
-                const float mag    = fftData[static_cast<size_t> (fBin)];
+                // fftData 现为 re/im 交错（RealOnly 输出），须用 re/im 算幅度，
+                // 否则会读到错位的 re/im 值（FFT 改造后的回归点）。
+                const float re    = fftData[static_cast<size_t> (2 * fBin)];
+                const float im    = fftData[static_cast<size_t> (2 * fBin + 1)];
+                const float mag   = std::sqrt (re * re + im * im);
                 const float db     = juce::Decibels::gainToDecibels(juce::jmax(1.0e-6f, mag));
                 const float mapped = juce::jlimit(0.0f, 1.0f,
                                         juce::jmap(db, -50.0f, 50.0f, 0.0f, 1.0f));
@@ -579,14 +588,26 @@ void AnalyserHub::pushSamplesToSpectrum(const float* left, const float* right, i
         std::fill (fftDataLo.begin() + fftSizeLo, fftDataLo.end(), 0.0f);
 
         windowLo.multiplyWithWindowingTable(fftDataLo.data(), fftSizeLo);
-        fftLo.performFrequencyOnlyForwardTransform(fftDataLo.data());
+        fftLo.performRealOnlyForwardTransform(fftDataLo.data(), true);
 
-        // 归一化（与主路保持一致的公式：2 / fftSize）
+        // 归一化 + 复频谱（与主路保持一致的公式：2 / fftSize）
         {
             const int   maxBinLo = fftSizeLo / 2;
             const float invMaxLo = 2.0f / static_cast<float> (fftSizeLo);
+            // 帧对滚动：旧 workCur → workPrev，本帧 → workCur。
+            //   保证发布出去的 prev/current 永远是相邻两帧（hop = fftSizeLo/4）。
+            std::memcpy (specReLoWorkPrev.data(), specReLoWork.data(),
+                         sizeof (float) * specReLoWork.size());
+            std::memcpy (specImLoWorkPrev.data(), specImLoWork.data(),
+                         sizeof (float) * specImLoWork.size());
             for (int iBin = 0; iBin < maxBinLo; ++iBin)
-                magDataLoWork[static_cast<size_t> (iBin)] = fftDataLo[static_cast<size_t> (iBin)] * invMaxLo;
+            {
+                const float re = fftDataLo[static_cast<size_t> (2 * iBin)];
+                const float im = fftDataLo[static_cast<size_t> (2 * iBin + 1)];
+                magDataLoWork[static_cast<size_t> (iBin)] = std::sqrt (re * re + im * im) * invMaxLo;
+                specReLoWork[static_cast<size_t> (iBin)] = re * invMaxLo;
+                specImLoWork[static_cast<size_t> (iBin)] = im * invMaxLo;
+            }
         }
 
         publishLo = true;
@@ -608,6 +629,11 @@ void AnalyserHub::pushSamplesToSpectrum(const float* left, const float* right, i
             {
                 std::memcpy (magDataLo.data(), magDataLoWork.data(),
                              sizeof (float) * magDataLo.size());
+                // 低频路复频谱发布：prev ← workPrev，cur ← workCur（相邻帧对）
+                std::memcpy (prevSpecReLo.data(), specReLoWorkPrev.data(), sizeof (float) * prevSpecReLo.size());
+                std::memcpy (prevSpecImLo.data(), specImLoWorkPrev.data(), sizeof (float) * prevSpecImLo.size());
+                std::memcpy (specReLo.data(), specReLoWork.data(), sizeof (float) * specReLo.size());
+                std::memcpy (specImLo.data(), specImLoWork.data(), sizeof (float) * specImLo.size());
             }
         });
     }
@@ -785,6 +811,155 @@ void AnalyserHub::getSpectrumMagnitudesBlended (juce::Array<float>& dest,
 
         outData[i] = out;
     }
+}
+
+// ==========================================================
+// 重分配谱图（频率重分配）—— 相位差法估计瞬时频率
+//
+//   原理（重分配谱图的相位差实现，phase-vocoder 风格）：
+//     STFT 每个 bin 的"能量质心"并不在 bin 中心频率，而在"瞬时频率"
+//       ω̂_k = ω_k + Δφ_k / hopTime
+//     其中 Δφ_k = arg(X_k · conj(X_prev,k)) 是相邻帧的相位差。
+//     把 |X_k|² 从 bin 中心 ω_k 搬到瞬时频率 ω̂_k，就能把因频谱泄漏
+//     而扩散的能量重新"凝聚"到真实频率上 —— 视觉上从"脏热点"变成"粒子"。
+//
+//   为什么用低频路（8192 FFT、75% overlap、hop=2048）而非主路：
+//     相位差法的"无折叠范围"是 |Δf| ≤ fs/(2·hop)。主路非重叠（hop=2048）
+//     只有 ±0.5 bin，主瓣边缘 bin 全折叠成伪影线（"很多根线"）；低频路
+//     hop 相对 binHz=5.86Hz 是 ±2 bin，覆盖 Hann 主瓣，才能干净收束。
+//
+//   折叠伪影的去除（关键！无此过滤则正弦波显示为等间隔 fs/hop 的多根线）：
+//     无折叠范围之外的 bin，Δφ 被 atan2 折叠，散射到 f ± n·(fs/hop) 的
+//     镜像位置。真实单频成分主瓣内相邻 bin 的瞬时频率"一致"（都指向
+//     同一频率），折叠 bin 的瞬时频率与邻居"跳变" —— 这正是重分配谱图
+//     标准的相干性过滤（coherence test）。再配合帧内相对门限压掉
+//     旁瓣折叠组，正弦波才能像 MiniMeters 一样收束成一根线。
+// ==========================================================
+void AnalyserHub::getSpectrumReassignedBlended (juce::Array<float>& dest,
+                                                int   numPoints,
+                                                float fMin,
+                                                float fMax)
+{
+    numPoints = juce::jmax (2, numPoints);
+    dest.resize (numPoints);
+    auto* outData = dest.getRawDataPointer();
+    std::fill (outData, outData + numPoints, 0.0f);
+
+    const double cachedSr = cachedSampleRate.load (std::memory_order_relaxed);
+    const double sr       = (cachedSr > 0.0) ? cachedSr : 48000.0;
+    const double nyquist  = sr * 0.5;
+
+    const double fLo = juce::jmax (1.0, static_cast<double> (fMin));
+    const double fHi = juce::jmin (nyquist, static_cast<double> (fMax));
+    if (fHi <= fLo) return;
+
+    // 低频路 8192 FFT、75% overlap：hop = fftSizeLo/4 样本
+    //   瞬时频率偏移 Δf = Δφ / (2π·hopTime) = Δφ · fs / (2π·hopSamples)。
+    //   注意单位：dphi 是弧度，换算成 Hz 要乘 fs/(2π·hop)，而非除以 (2π/hopTime)
+    //   —— 后者会把偏移缩小 hopTime²≈550 倍，导致能量几乎不搬动。
+    const double hopSamples = static_cast<double> (fftSizeLo) / 4.0;
+    const double binHz      = sr / static_cast<double> (fftSizeLo);
+    const double dphiToHz   = sr / (juce::MathConstants<double>::twoPi * hopSamples);
+
+    // thread_local 快照（与 getSpectrumMagnitudesBlended 一致，零栈分配）
+    thread_local std::array<float, spectrumMagSizeLo> reSnap, imSnap, preSnap, pimSnap;
+    thread_local std::array<float, spectrumMagSizeLo> fhat;    // 每 bin 瞬时频率（Hz）
+    thread_local std::array<float, spectrumMagSizeLo> mag2;    // 每 bin 能量
+    {
+        const juce::SpinLock::ScopedLockType sl (specLock);
+        std::memcpy (reSnap.data(),  specReLo.data(),     sizeof (float) * reSnap.size());
+        std::memcpy (imSnap.data(),  specImLo.data(),     sizeof (float) * imSnap.size());
+        std::memcpy (preSnap.data(), prevSpecReLo.data(), sizeof (float) * preSnap.size());
+        std::memcpy (pimSnap.data(), prevSpecImLo.data(), sizeof (float) * pimSnap.size());
+    }
+
+    const double logMin   = std::log10 (fLo);
+    const double logMax   = std::log10 (fHi);
+    const double logRange = juce::jmax (1.0e-9, logMax - logMin);
+
+    // 绝对能量阈值：对应约 -90 dBFS（与 UI 显示下限 minDb 一致）
+    constexpr float kMag2Threshold = 1.0e-9f;
+    // 帧内相对门限：比本帧最强 bin 低 30dB 以上的不散射。
+    //   作用：压掉旁瓣的"折叠镜像组"（相邻旁瓣 bin 常折叠到同一镜像位置，
+    //   单靠相干过滤拦不住）。对复音/音乐 = Sharp 模式动态范围 30dB，
+    //   更弱的成分看 Classic。
+    constexpr float kRelMag2FloorDb = 30.0f;
+
+    // ---- Pass 1：逐 bin 瞬时频率 + 能量 ----
+    float maxMag2 = 0.0f;
+    for (int k = 0; k < spectrumMagSizeLo; ++k)
+    {
+        const float re   = reSnap[static_cast<size_t> (k)];
+        const float im   = imSnap[static_cast<size_t> (k)];
+        const float m2   = re * re + im * im;
+        mag2[static_cast<size_t> (k)] = m2;
+
+        if (m2 < kMag2Threshold)
+        {
+            fhat[static_cast<size_t> (k)] = static_cast<float> (static_cast<double> (k) * binHz);
+            continue;
+        }
+        if (m2 > maxMag2) maxMag2 = m2;
+
+        const float pre = preSnap[static_cast<size_t> (k)];
+        const float pim = pimSnap[static_cast<size_t> (k)];
+
+        // 相位差（含 heterodyne 修正）：
+        //   Δφ = princarg( arg(X_cur·conj(X_prev)) − 2π·k·hop/N )
+        //   其中 −2π·k·hop/N 是"bin k 固有频率 f_k 在 hop 样本内的自然相位
+        //   推进"。JUCE 的 FFT 是切片式（窗口固定、帧信号为 x[n+t] 切片），
+        //   其相邻帧相位差 = 2π·f0·hop/fs 与 bin 无关、且对任何
+        //   f0 > fs/(2·hop) 全部折叠；必须减去这个固有推进项，才能得到真正
+        //   的瞬时频率偏移（标准 phase-vocoder / Fitz-Haken 公式）。漏掉它
+        //   会导致 f̂ 全部错误 → 相干过滤把一切拒掉（频谱全空）。
+        const double expectedPhase = juce::MathConstants<double>::twoPi
+                                   * static_cast<double> (k) * hopSamples
+                                   / static_cast<double> (fftSizeLo);
+        double dphi = static_cast<double> (std::atan2 (im * pre - re * pim, re * pre + im * pim))
+                    - expectedPhase;
+        dphi = std::atan2 (std::sin (dphi), std::cos (dphi));   // princarg 折叠到 [-π, π]
+
+        // 瞬时频率：f̂ = f_k + Δφ · fs/(2π·hop)
+        fhat[static_cast<size_t> (k)] = static_cast<float> (
+            static_cast<double> (k) * binHz + dphi * dphiToHz);
+    }
+
+    // 帧内相对门限（-30dB，能量域）
+    const float relMag2Floor = juce::jmax (kMag2Threshold,
+        maxMag2 * std::pow (10.0f, -kRelMag2FloorDb / 10.0f));
+
+    // ---- Pass 2：相干性过滤 + 散射 ----
+    //   真实成分主瓣内相邻 bin 的 f̂ 一致；折叠/噪声 bin 的 f̂ 与邻居跳变。
+    //   相干判定：与左或右任一邻居的 f̂ 差 ≤ 1 个 bin 宽即认为相干。
+    for (int k = 0; k < spectrumMagSizeLo; ++k)
+    {
+        const float m2 = mag2[static_cast<size_t> (k)];
+        if (m2 < relMag2Floor) continue;
+
+        const float fk = fhat[static_cast<size_t> (k)];
+        bool coherent = false;
+        if (k > 0
+            && std::fabs (fk - fhat[static_cast<size_t> (k - 1)]) <= binHz)
+            coherent = true;
+        if (! coherent && k < spectrumMagSizeLo - 1
+            && std::fabs (fk - fhat[static_cast<size_t> (k + 1)]) <= binHz)
+            coherent = true;
+        if (! coherent) continue;   // 折叠/噪声 bin：弃
+
+        // 落到对应对数行（clamp 到 [fLo, fHi]）
+        //   dest 顺序与 getSpectrumMagnitudesBlended 一致：index 0=低频 → 末尾=高频
+        const double f   = juce::jlimit (fLo, fHi, static_cast<double> (fk));
+        const double t   = (std::log10 (f) - logMin) / logRange;   // 0=低频, 1=高频
+        const int    row = static_cast<int> (std::round (t * static_cast<double> (numPoints - 1)));
+        const int    rr  = juce::jlimit (0, numPoints - 1, row);
+
+        // 能量累加：凝聚到同一行的多个 bin 求和
+        outData[rr] += m2;
+    }
+
+    // 能量 → 幅度（与 Classic 幅度同量纲，UI 的 dB 映射无需改）
+    for (int i = 0; i < numPoints; ++i)
+        outData[i] = std::sqrt (juce::jmax (0.0f, outData[i]));
 }
 
 // ==========================================================

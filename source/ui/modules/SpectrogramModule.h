@@ -42,6 +42,14 @@ public:
     void  setCellPx (int px);
     int   getCellPx() const noexcept { return cellPx; }
 
+    // ---- 显示模式（Classic / Sharp / Sharper）----
+    //   Classic : 原始幅度谱（不锐化）
+    //   Sharp   : 频率轴锐化（unsharp mask，谱线变锐）
+    //   Sharper : 频率轴 + 时间轴锐化（瞬态更突出）
+    enum class DisplayMode : int { Classic = 0, Sharp = 1, Sharper = 2 };
+    void        setDisplayMode (DisplayMode m);
+    DisplayMode getDisplayMode() const noexcept { return displayMode; }
+
 protected:
     void layoutContent (juce::Rectangle<int> contentBounds) override;
     void paintContent  (juce::Graphics& g, juce::Rectangle<int> contentBounds) override;
@@ -55,6 +63,7 @@ private:
     void ensureGrid (int canvasW, int canvasH);
 
     // 把当前已合并到「rows 个对数频率点」的线性幅度写到 grid 的 writeCol 列
+    //   （Classic 用原始幅度；Sharp/Sharper 用重分配后的幅度，见 onFrame）
     void pushColumn (const juce::Array<float>& rowsMags);
 
     // 方案 B：把 grid 的"最新一列强度"写入离屏 Image 的对应像素列。
@@ -133,7 +142,15 @@ private:
     // ---- 右侧控制条（样式与 EqModule 的 SIZE 滑条一致）----
     juce::Slider speedSlider;
     juce::Label  speedLabel;
+    juce::TextButton modeBtn { "+" };   // 右下角显示模式切换（样式对齐 3D 模块的 TINT）
     static constexpr int sliderPanelW = 42;  // 右侧滑条面板宽度（与 WaveformModule 的 GAIN 面板一致）
+
+    // ---- 显示模式状态 ----
+    //   Classic : 原始幅度谱（getSpectrumMagnitudesBlended）
+    //   Sharp   : 频率重分配（getSpectrumReassignedBlended，能量凝聚成粒子）
+    //   Sharper : 频率重分配（时间重分配作为后续增强）
+    DisplayMode displayMode = DisplayMode::Sharp;   // 默认 Sharp
+    static const char* displayModeText (DisplayMode m) noexcept;
 
     // 主题订阅 token：切换主题时重新下发 Label / Slider textBox 的墨色
     int themeSubToken = -1;

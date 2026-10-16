@@ -41,12 +41,27 @@ SpectrogramModule::SpectrogramModule (AnalyserHub& h)
     speedLabel.setFont   (PinkXP::getFont (11.0f, juce::Font::bold));
     speedLabel.setText   ("SPEED", juce::dontSendNotification);
 
+    // ---------- 右下角显示模式切换按钮（样式对齐 Spectrogram3DModule 的 TINT）----------
+    //   · 三态循环：Classic → Sharp → Sharper → Classic，默认 Sharp
+    //   · 不是 toggle（三选一循环），点击一次切到下一档
+    modeBtn.setClickingTogglesState (false);
+    modeBtn.setButtonText (displayModeText (displayMode));
+    modeBtn.setTooltip ("Spectrogram display mode: \"-\" Classic (raw magnitude), "
+                        "\"+\" Sharp (frequency reassignment), "
+                        "\"++\" Sharper (time + frequency reassignment).");
+    modeBtn.onClick = [this]()
+    {
+        const int next = ((int) displayMode + 1) % 3;
+        setDisplayMode ((DisplayMode) next);
+    };
+
     themeSubToken = PinkXP::subscribeThemeChanged ([this]()
     {
         speedLabel.setColour  (juce::Label::textColourId,          PinkXP::ink);
         speedSlider.setColour (juce::Slider::textBoxTextColourId,  PinkXP::ink);
         speedLabel.repaint();
         speedSlider.repaint();
+        modeBtn.repaint();
 
         // 刷新 Spectrogram 瀑布图 base/accent 颜色并失效 Image 缓存，
         // 下一帧 paint 会全量重绘为新配色。
@@ -59,6 +74,7 @@ SpectrogramModule::SpectrogramModule (AnalyserHub& h)
 
     addAndMakeVisible (speedSlider);
     addAndMakeVisible (speedLabel);
+    addAndMakeVisible (modeBtn);
 }
 
 SpectrogramModule::~SpectrogramModule()
@@ -78,6 +94,33 @@ void SpectrogramModule::setCellPx (int px)
     cellPx = juce::jlimit (2, 32, px);
     // 强制下一次 ensureGrid 重建
     lastCanvasW = lastCanvasH = 0;
+    repaint();
+}
+
+const char* SpectrogramModule::displayModeText (DisplayMode m) noexcept
+{
+    switch (m)
+    {
+        case DisplayMode::Classic:  return "-";
+        case DisplayMode::Sharper:  return "++";
+        case DisplayMode::Sharp:
+        default:                    return "+";
+    }
+}
+
+void SpectrogramModule::setDisplayMode (DisplayMode m)
+{
+    if (displayMode == m) return;
+
+    displayMode = m;
+    modeBtn.setButtonText (displayModeText (m));
+
+    // 切换模式后，grid 里已有的旧列仍是旧模式的数据（无法重算——重分配依赖
+    // 相位历史），会随滚动自然过渡到新模式；这里仅重绘当前 image，新数据在
+    // 下一帧 onFrame 按新模式数据源写入。
+    if (imageBuf.isValid())
+        redrawFullImage();
+
     repaint();
 }
 
@@ -104,7 +147,9 @@ void SpectrogramModule::layoutContent (juce::Rectangle<int> contentBounds)
 
     auto labelArea = rightPanel.removeFromTop (14);
     speedLabel.setBounds  (labelArea);
+    auto btnArea = rightPanel.removeFromBottom (18);   // 右下角模式按钮（与 3D TINT 一致）
     speedSlider.setBounds (rightPanel);
+    modeBtn.setBounds    (btnArea);
 }
 
 void SpectrogramModule::resized()
@@ -248,7 +293,12 @@ void SpectrogramModule::onFrame (const AnalyserHub::FrameSnapshot& frame)
     const float  fMin    = minFreqHz;
     const float  fMax    = juce::jmin (maxFreqHz, (float) (nyquist * 0.95));
 
-    hub.getSpectrumMagnitudesBlended (rowMagBuf, rows, fMin, fMax);
+    // 显示模式选择数据源：
+    //   Classic → 原始幅度谱；Sharp/Sharper → 频率重分配（粒子凝聚）
+    if (displayMode == DisplayMode::Classic)
+        hub.getSpectrumMagnitudesBlended (rowMagBuf, rows, fMin, fMax);
+    else
+        hub.getSpectrumReassignedBlended (rowMagBuf, rows, fMin, fMax);
 
     // ---------- 速度解耦：按"真实流逝时间"累计推进列数 ----------
     //   旧行为：每帧 push 1 列 → 滚动速度 = 分发 fps（Hub 30/60Hz 直接体现在速度上）。
