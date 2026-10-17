@@ -14,11 +14,11 @@
 #
 # 前置条件：
 #   在 IDE（CLion 等）里已经用 Release 配置把下面 5 个 target 构建出来：
-#     cmake-build-release/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter.app
-#     cmake-build-release/Y2Kmeter_artefacts/Release/VST3/Y2Kmeter.vst3
-#     cmake-build-release/Y2Kmeter_artefacts/Release/AU/Y2Kmeter.component
-#     cmake-build-release/Y2Kmeter_milkdrop_artefacts/Release/VST3/Y2Kmeter_milkdrop.vst3
-#     cmake-build-release/Y2Kmeter_milkdrop_artefacts/Release/AU/Y2Kmeter_milkdrop.component
+#     build/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter.app
+#     build/Y2Kmeter_artefacts/Release/VST3/Y2Kmeter.vst3
+#     build/Y2Kmeter_artefacts/Release/AU/Y2Kmeter.component
+#     build/Y2Kmeter_milkdrop_artefacts/Release/VST3/Y2Kmeter_milkdrop.vst3
+#     build/Y2Kmeter_milkdrop_artefacts/Release/AU/Y2Kmeter_milkdrop.component
 #   本脚本不负责触发 cmake 构建，只基于现有产物做签名 + 打包。
 #
 # 依赖：command line tools 自带的 ditto / pkgbuild / productbuild / hdiutil / codesign
@@ -36,7 +36,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${SCRIPT_DIR}"
-BUILD_DIR="${PROJECT_ROOT}/cmake-build-release"
+BUILD_DIR="${PROJECT_ROOT}/build"
 DIST_DIR="${PROJECT_ROOT}/dist"
 WORK_DIR="${DIST_DIR}/.mac_installer_work"
 STAGE_DIR="${WORK_DIR}/stage"
@@ -225,7 +225,7 @@ log "Step 2/7 Validate build artifacts"
 if [[ ! -d "${STANDALONE_APP}" ]]; then
   echo "[ERROR] Missing standalone app: ${STANDALONE_APP}" >&2
   echo "[HINT] Build first:" >&2
-  echo "       cmake --build cmake-build-release --target Y2Kmeter_Standalone" >&2
+  echo "       cmake --build build --target Y2Kmeter_Standalone" >&2
   exit 1
 fi
 log "  - App : ${STANDALONE_APP} [$(bundle_archs "${STANDALONE_APP}")]"
