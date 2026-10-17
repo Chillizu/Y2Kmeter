@@ -25,6 +25,68 @@
 #include "source/analysis/AnalyserHub.h"
 #include "source/ui/MilkdropParamIds.h"
 
+#if JUCE_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX   // 阻止 windows.h 定义 min/max 宏（污染 std::min/std::max）
+#endif
+#include <windows.h>
+#include <shellapi.h>
+
+namespace {
+    // Windows AppBar（SHAppBarMessage）封装：把顶层窗口注册为 AppBar，
+    // 停靠到屏幕顶/底边并让系统缩小工作区（其他窗口自动让开这条边）。
+    // 这是 MiniMeters "stick" 的同一套机制（任务栏式驻留）。
+    HWND y2kGetWindowHwnd (juce::Component* c) noexcept
+    {
+        if (c == nullptr) return nullptr;
+        auto* peer = c->getPeer();
+        return peer != nullptr ? reinterpret_cast<HWND> (peer->getNativeHandle()) : nullptr;
+    }
+
+    void y2kAppBarDock (juce::Component* window, bool bottom) noexcept
+    {
+        const HWND hwnd = y2kGetWindowHwnd (window);
+        if (hwnd == nullptr) return;
+
+        APPBARDATA abd = {};
+        abd.cbSize = sizeof (abd);
+        abd.hWnd   = hwnd;
+
+        // 幂等：先移除旧注册再注册，避免重复 dock 时状态错乱
+        SHAppBarMessage (ABM_REMOVE, &abd);
+
+        if (SHAppBarMessage (ABM_NEW, &abd) == FALSE)
+            return;   // 注册失败（如 hwnd 无效），放弃
+
+        // 设置停靠边 + 期望矩形（窗口当前屏幕矩形）
+        abd.uEdge = bottom ? ABE_BOTTOM : ABE_TOP;
+        GetWindowRect (hwnd, &abd.rc);
+
+        // 查询系统计算的建议位置（abd.rc 会被更新为贴边后的最终矩形）
+        SHAppBarMessage (ABM_QUERYPOS, &abd);
+
+        // 提交：系统据此缩小工作区（其他窗口让开这条边）
+        SHAppBarMessage (ABM_SETPOS, &abd);
+
+        // 把窗口移动到系统建议的最终矩形（ABE_TOP/BOTTOM 下宽度=工作区宽）
+        MoveWindow (hwnd, abd.rc.left, abd.rc.top,
+                    abd.rc.right  - abd.rc.left,
+                    abd.rc.bottom - abd.rc.top, TRUE);
+    }
+
+    void y2kAppBarUndock (juce::Component* window) noexcept
+    {
+        const HWND hwnd = y2kGetWindowHwnd (window);
+        if (hwnd == nullptr) return;
+
+        APPBARDATA abd = {};
+        abd.cbSize = sizeof (abd);
+        abd.hWnd   = hwnd;
+        SHAppBarMessage (ABM_REMOVE, &abd);
+    }
+} // namespace
+#endif
+
 // ==========================================================
 // 屏幕尺寸模拟（仅开发调试用）
 //   环境变量 Y2KM_SIMULATE_SCREEN 格式 "宽x高"（如 "2560x1080" 模拟 21:9、
@@ -227,7 +289,7 @@ public:
         const juce::Font versionFont = PinkXP::getFont (10.0f, juce::Font::italic);
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
         const int nameW    = nameFont.getStringWidth ("Y2Kmeter");
-const int versionW = versionFont.getStringWidth ("v2.8.0");
+const int versionW = versionFont.getStringWidth ("v2.8.1");
         const int urlW     = urlFont.getStringWidth ("iisaacbeats.cn");
         constexpr int gap1 = 6;
         constexpr int gap2 = 10;
@@ -268,7 +330,7 @@ const int versionW = versionFont.getStringWidth ("v2.8.0");
     {
         // ------- 1) 顶部抬头文字：软件名 + 版本号 + 官网（低对比度，贴在底图上）-------
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.8.0";
+const juce::String versionText = "v2.8.1";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont(12.0f, juce::Font::plain);
@@ -1287,6 +1349,13 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
     {
         if (onLoadSettingsRequested) onLoadSettingsRequested (src);
     };
+
+#if JUCE_WINDOWS
+    // 4.05c) stick 模式按钮（Windows 专属）：STICK 进入 / X 退出 / T-B 顶底切换
+    workspace->onStickClicked       = [this]() { enterStickMode(); };
+    workspace->onStickExitClicked   = [this]() { exitStickMode(); };
+    workspace->onStickToggleClicked = [this]() { toggleStickTopBottom(); };
+#endif
 
     // 4.1) chrome 可见性变化 → 隐藏/显示顶部 TitleBar
     //     切换时需要 resized() 重新布局（隐藏后 workspace 应占满整个窗口），
@@ -3468,7 +3537,7 @@ void Y2KmeterAudioProcessorEditor::paint(juce::Graphics& g)
 
         // 主标题 "Y2Kmeter"
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.8.0";
+const juce::String versionText = "v2.8.1";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont (12.0f, juce::Font::bold);
@@ -3476,7 +3545,7 @@ const juce::String versionText = "v2.8.0";
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
 
         const int nameW    = nameFont.getStringWidth (nameText);
-        const int versionW = versionFont.getStringWidth ("v2.8.0");
+        const int versionW = versionFont.getStringWidth ("v2.8.1");
         const int urlW     = urlFont.getStringWidth (urlText);
 
         constexpr int gap1 = 6;   // name ↔ version 之间
@@ -3556,16 +3625,19 @@ const juce::String versionText = "v2.8.0";
                           lockButtonHovered, lockButtonPressed, layoutLocked,
                           "L", 12.0f, -1, -2);
 
-            // 3a) 最小化按钮："_"（字体里下划线位置偏低，y=-3 让底横线略高一点更像传统 _ 位置）
-            drawTitleBtn (getMinimiseButtonBounds(),
-                          minButtonHovered, minButtonPressed, false,
-                          "_", 12.0f, -1, -3);
+            // 3a) 最小化按钮 + 3b) 固定（置顶）按钮
+            //   stick 模式（AppBar 驻留）下隐藏：驻留态宽度被系统锁死、
+            //   高度可调，置顶/最小化语义不再适用（对齐 MiniMeters 的 stick）。
+            if (! stickActive)
+            {
+                drawTitleBtn (getMinimiseButtonBounds(),
+                              minButtonHovered, minButtonPressed, false,
+                              "_", 12.0f, -1, -3);
 
-            // 3b) 固定（置顶）按钮：未激活 "*"  / 激活 "*"(凹陷) —— 使用易识别的星号符号
-            //     字体里 '*' 位置偏下，y=-2 做居中微调（相对最小化 y=-3 略低 1 像素更对眼）
-            drawTitleBtn (getPinButtonBounds(),
-                          pinButtonHovered, pinButtonPressed, alwaysOnTopActive,
-                          "*", 14.0f, -1, -2);
+                drawTitleBtn (getPinButtonBounds(),
+                              pinButtonHovered, pinButtonPressed, alwaysOnTopActive,
+                              "*", 14.0f, -1, -2);
+            }
 
             // 3c) 关闭按钮："x"（字体里 'x' 位置正常，仅 y=-1 做微调）
             drawTitleBtn (getCloseButtonBounds(),
@@ -3993,6 +4065,114 @@ void Y2KmeterAudioProcessorEditor::handleMinimiseClicked()
     }
 }
 
+#if JUCE_WINDOWS
+// ==========================================================
+// stick 模式（Windows 专属：AppBar 硬 stick 驻留）
+//   进入：备份当前布局 + 窗口 bounds → 切换 Horizontal Bar(T) → AppBar 驻留
+//         （缩小工作区，其他窗口被挤走）→ 隐藏最小化/置顶按钮
+//   退出：取消 AppBar → 恢复备份布局 + 窗口 bounds → 恢复按钮
+//   T/B：顶端（horizontalFull）/ 底端（horizontalBottom）切换
+// ==========================================================
+void Y2KmeterAudioProcessorEditor::enterStickMode()
+{
+    if (stickActive || workspace == nullptr) return;
+
+    auto* top = getTopLevelComponent();
+
+    // 1) 备份当前布局 + 窗口 bounds + resizeLimits
+    stickBackupLayout = workspace->saveLayoutTree();
+    if (top != nullptr)
+        stickBackupWindowBounds = top->getScreenBounds();
+    if (auto* cbc = getConstrainer())
+    {
+        stickSavedMinW = cbc->getMinimumWidth();
+        stickSavedMinH = cbc->getMinimumHeight();
+        stickSavedMaxW = cbc->getMaximumWidth();
+        stickSavedMaxH = cbc->getMaximumHeight();
+    }
+
+    // 1.5) 把所有浮动模块 dock 回工作区（与 onLayoutPresetChanged 的 floating
+    //      处理一致）。否则 clearAllModules 清不到浮动窗口里的模块，
+    //      seedDefaultModules 之后用户又能添加第二个（如 milkdrop）。
+    for (auto& wnd : floatingWindows_)
+    {
+        if (wnd != nullptr)
+        {
+            if (auto* content = dynamic_cast<ModulePanel*>(wnd->getContentComponent()))
+            {
+                const auto savedBounds = wnd->getSavedBounds();
+                wnd->setContentNonOwned(content, false);
+                workspace->dockModule(*content, savedBounds);
+            }
+            wnd.reset();
+        }
+    }
+    floatingWindows_.clear();
+
+    // 2) 标记激活 + 切换 Horizontal Bar(T)（贴顶横条）
+    stickActive        = true;
+    stickBottomAligned = false;
+    applyLayoutPreset ((int) ModuleWorkspace::LayoutPreset::horizontalFull);
+
+    // 2.5) 锁宽度：stick 模式只允许调高度，宽度锁死到当前（屏幕工作区）宽。
+    //      applyLayoutPreset 已放宽了高度范围，这里只把宽度 min/max 夹到当前宽。
+    if (auto* cbc = getConstrainer())
+    {
+        const int w = (top != nullptr) ? top->getWidth() : cbc->getMaximumWidth();
+        setResizeLimits (w, cbc->getMinimumHeight(), w, cbc->getMaximumHeight());
+    }
+
+    // 3) AppBar 驻留（缩小工作区，其他窗口让开这条边）
+    y2kAppBarDock (getTopLevelComponent(), stickBottomAligned);
+
+    // 4) 更新 UI（隐藏最小化/置顶按钮；toolbar 切换到 X + T/B）
+    repaint();
+    workspace->setStickActive (true);
+}
+
+void Y2KmeterAudioProcessorEditor::exitStickMode()
+{
+    if (! stickActive) return;
+
+    // 1) 取消 AppBar（恢复工作区）
+    y2kAppBarUndock (getTopLevelComponent());
+
+    stickActive = false;
+
+    // 1.5) 恢复 resizeLimits（解除宽度锁定）
+    setResizeLimits (stickSavedMinW, stickSavedMinH, stickSavedMaxW, stickSavedMaxH);
+
+    // 2) 恢复备份布局 + 窗口 bounds
+    if (workspace != nullptr && stickBackupLayout.isValid())
+        workspace->loadLayoutFromTree (stickBackupLayout);
+
+    if (auto* top = getTopLevelComponent())
+        if (! stickBackupWindowBounds.isEmpty())
+            top->setBounds (stickBackupWindowBounds);
+
+    stickBackupLayout       = juce::ValueTree();
+    stickBackupWindowBounds = {};
+
+    // 3) 更新 UI
+    repaint();
+    if (workspace != nullptr)
+        workspace->setStickActive (false);
+}
+
+void Y2KmeterAudioProcessorEditor::toggleStickTopBottom()
+{
+    if (! stickActive) return;
+
+    stickBottomAligned = ! stickBottomAligned;
+
+    applyLayoutPreset ((int) (stickBottomAligned
+        ? ModuleWorkspace::LayoutPreset::horizontalBottom
+        : ModuleWorkspace::LayoutPreset::horizontalFull));
+
+    y2kAppBarDock (getTopLevelComponent(), stickBottomAligned);
+}
+#endif
+
 // ==========================================================
 // 布局锁定按钮（v1.8.3 新增）
 //   · 切换 layoutLocked 状态；同步 workspace / Processor 持久化 / 顶层窗口 resize 上下限。
@@ -4239,8 +4419,12 @@ void Y2KmeterAudioProcessorEditor::mouseMove(const juce::MouseEvent& e)
     else
     {
         updateHover (closeButtonHovered, getCloseButtonBounds());
-        updateHover (pinButtonHovered,   getPinButtonBounds());
-        updateHover (minButtonHovered,   getMinimiseButtonBounds());
+        // stick 模式：pin/minimise 已隐藏，跳过 hover 检测（避免 cursor 变化）
+        if (! stickActive)
+        {
+            updateHover (pinButtonHovered,   getPinButtonBounds());
+            updateHover (minButtonHovered,   getMinimiseButtonBounds());
+        }
         updateHover (lockButtonHovered,  getLockButtonBounds());
 
         // 标题文字 hover 检测（实际文字像素矩形，宽度由 paint 回写）
@@ -4397,13 +4581,14 @@ void Y2KmeterAudioProcessorEditor::mouseDown(const juce::MouseEvent& e)
         repaint (getCloseButtonBounds());
         return;
     }
-    if (getPinButtonBounds().contains (e.getPosition()))
+    // stick 模式：最小化/置顶按钮已隐藏（paint 不画），这里也不再响应点击
+    if (! stickActive && getPinButtonBounds().contains (e.getPosition()))
     {
         pinButtonPressed = true;
         repaint (getPinButtonBounds());
         return;
     }
-    if (getMinimiseButtonBounds().contains (e.getPosition()))
+    if (! stickActive && getMinimiseButtonBounds().contains (e.getPosition()))
     {
         minButtonPressed = true;
         repaint (getMinimiseButtonBounds());
@@ -4434,10 +4619,10 @@ void Y2KmeterAudioProcessorEditor::mouseDown(const juce::MouseEvent& e)
 
     if (juce::JUCEApplicationBase::isStandaloneApp())
     {
-        // 锁定态：不启动顶层窗口拖拽。双击全屏的前置 mouseDown 不会受影响，
-        //   因为下面不会将 draggingWindow 置 true，mouseDrag 也不会拖。双击全屏
-        //   本身在锁定态下仍允许（属于"窗口尺寸"而非"用户拖拽"）。
-        if (! layoutLocked)
+        // 锁定态 / stick 驻留态：不启动顶层窗口拖拽。双击全屏的前置 mouseDown
+        //   不会受影响，因为下面不会将 draggingWindow 置 true，mouseDrag 也不会拖。
+        //   双击全屏本身仍允许（属于"窗口尺寸"而非"用户拖拽"）。
+        if (! layoutLocked && ! stickActive)
         {
             if (auto* top = getTopLevelComponent())
             {
@@ -4484,8 +4669,35 @@ void Y2KmeterAudioProcessorEditor::mouseUp(const juce::MouseEvent& e)
             if (! area.isEmpty())
             {
                 const auto b = top->getScreenBounds();
+
+                // 顶部拖出回弹（原有）：标题栏拖出工作区顶部 → 强制弹回，
+                //   防止窗口"丢失"在屏幕上方（找不到标题栏拖回）。
                 if (b.getY() < area.getY())
+                {
                     top->setTopLeftPosition (b.getX(), area.getY());
+                }
+                else
+                {
+                    // 四边边缘吸附（软 stick）：松手时任一边距工作区边缘
+                    //   ≤ 阈值即贴到该边，方便把窗口精确调到屏幕边缘；
+                    //   再次拖动窗口会自动脱离吸附（无"锁定"语义）。
+                    constexpr int kStickThresholdPx = 8;
+                    int x = b.getX();
+                    int y = b.getY();
+
+                    if (std::abs (b.getX() - area.getX()) <= kStickThresholdPx)
+                        x = area.getX();
+                    else if (std::abs (b.getRight() - area.getRight()) <= kStickThresholdPx)
+                        x = area.getRight() - b.getWidth();
+
+                    if (std::abs (b.getY() - area.getY()) <= kStickThresholdPx)
+                        y = area.getY();
+                    else if (std::abs (b.getBottom() - area.getBottom()) <= kStickThresholdPx)
+                        y = area.getBottom() - b.getHeight();
+
+                    if (x != b.getX() || y != b.getY())
+                        top->setTopLeftPosition (x, y);
+                }
             }
         }
     }

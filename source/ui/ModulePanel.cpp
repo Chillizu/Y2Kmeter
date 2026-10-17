@@ -423,12 +423,20 @@ void ModulePanel::resized()
 ModulePanel::Edge ModulePanel::detectEdge(juce::Point<int> pos) const
 {
     const int hot = PinkXP::ui(edgeHotSize);
+    const bool nearLeft   = pos.x < hot;
     const bool nearRight  = pos.x >= getWidth()  - hot;
+    const bool nearTop    = pos.y < hot;
     const bool nearBottom = pos.y >= getHeight() - hot;
 
+    // 角优先于边（四角同时命中两条边）
+    if (nearLeft  && nearTop)    return Edge::topLeft;
+    if (nearRight && nearTop)    return Edge::topRight;
+    if (nearLeft  && nearBottom) return Edge::bottomLeft;
     if (nearRight && nearBottom) return Edge::bottomRight;
-    if (nearRight)                return Edge::right;
-    if (nearBottom)               return Edge::bottom;
+    if (nearLeft)                return Edge::left;
+    if (nearRight)               return Edge::right;
+    if (nearTop)                 return Edge::top;
+    if (nearBottom)              return Edge::bottom;
     return Edge::none;
 }
 
@@ -436,10 +444,15 @@ void ModulePanel::updateCursorFor(Edge e)
 {
     switch (e)
     {
-        case Edge::right:        setMouseCursor(juce::MouseCursor::LeftRightResizeCursor); break;
-        case Edge::bottom:       setMouseCursor(juce::MouseCursor::UpDownResizeCursor);    break;
+        case Edge::left:
+        case Edge::right:        setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);         break;
+        case Edge::top:
+        case Edge::bottom:       setMouseCursor(juce::MouseCursor::UpDownResizeCursor);            break;
+        case Edge::topLeft:      setMouseCursor(juce::MouseCursor::TopLeftCornerResizeCursor);     break;
         case Edge::bottomRight:  setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor); break;
-        default:                 setMouseCursor(juce::MouseCursor::NormalCursor);          break;
+        case Edge::topRight:     setMouseCursor(juce::MouseCursor::TopRightCornerResizeCursor);    break;
+        case Edge::bottomLeft:   setMouseCursor(juce::MouseCursor::BottomLeftCornerResizeCursor);  break;
+        default:                 setMouseCursor(juce::MouseCursor::NormalCursor);                  break;
     }
 }
 
@@ -605,20 +618,42 @@ void ModulePanel::mouseDrag(const juce::MouseEvent& e)
     }
     else if (dragMode == DragMode::resize)
     {
-        auto newBounds = dragStartBounds;
-        if (resizeEdge == Edge::right || resizeEdge == Edge::bottomRight)
-            newBounds.setWidth(juce::jmax(minW, dragStartBounds.getWidth()  + delta.x));
-        if (resizeEdge == Edge::bottom || resizeEdge == Edge::bottomRight)
-            newBounds.setHeight(juce::jmax(minH, dragStartBounds.getHeight() + delta.y));
+        // 四边 resize：锚点边固定，拖动边跟随鼠标（delta）。
+        //   用 left/top/right/bottom 四条边统一表达，避免"只调宽高"无法处理
+        //   左/上边（它们会移动 x/y，锚点在对面）。
+        int left   = dragStartBounds.getX();
+        int top    = dragStartBounds.getY();
+        int right  = dragStartBounds.getRight();
+        int bottom = dragStartBounds.getBottom();
+
+        const bool touchLeft   = (resizeEdge == Edge::left   || resizeEdge == Edge::topLeft    || resizeEdge == Edge::bottomLeft);
+        const bool touchRight  = (resizeEdge == Edge::right  || resizeEdge == Edge::topRight   || resizeEdge == Edge::bottomRight);
+        const bool touchTop    = (resizeEdge == Edge::top    || resizeEdge == Edge::topLeft    || resizeEdge == Edge::topRight);
+        const bool touchBottom = (resizeEdge == Edge::bottom || resizeEdge == Edge::bottomLeft || resizeEdge == Edge::bottomRight);
+
+        if (touchLeft)   left   = dragStartBounds.getX()      + delta.x;
+        if (touchRight)  right  = dragStartBounds.getRight()  + delta.x;
+        if (touchTop)    top    = dragStartBounds.getY()      + delta.y;
+        if (touchBottom) bottom = dragStartBounds.getBottom() + delta.y;
+
+        // 最小尺寸约束
+        if (touchLeft)   left   = juce::jmin (left,   right - minW);
+        if (touchRight)  right  = juce::jmax (right,  left  + minW);
+        if (touchTop)    top    = juce::jmin (top,    bottom - minH);
+        if (touchBottom) bottom = juce::jmax (bottom, top   + minH);
 
         // 不出父容器
         if (auto* parent = getParentComponent())
         {
-            newBounds.setWidth (juce::jmin(newBounds.getWidth(),  parent->getWidth()  - newBounds.getX()));
-            newBounds.setHeight(juce::jmin(newBounds.getHeight(), parent->getHeight() - newBounds.getY()));
+            left   = juce::jmax (0, left);
+            top    = juce::jmax (0, top);
+            right  = juce::jmin (parent->getWidth(),  right);
+            bottom = juce::jmin (parent->getHeight(), bottom);
         }
 
-        setBounds(newBounds);
+        setBounds (juce::Rectangle<int> (left, top,
+                                         juce::jmax (1, right - left),
+                                         juce::jmax (1, bottom - top)));
     }
 
     // 拖拽过程中持续回调（workspace 用它更新吸附预览）

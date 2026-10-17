@@ -206,6 +206,20 @@ private:
     //     以避免在此头文件里 include 完整的 ModuleWorkspace.h）
     void applyLayoutPreset (int presetId);
 
+    // stick 模式是否激活（Windows 专属；非 Windows 恒 false，paint 无需 #if 即可判断）
+    bool isStickActive() const noexcept { return stickActive; }
+
+#if JUCE_WINDOWS
+    // ---- stick 模式（Windows 专属：AppBar 硬 stick 驻留）----
+    //   进入：备份当前布局 + 窗口 bounds → 切换 Horizontal Bar(T) → AppBar 驻留
+    //         （SHAppBarMessage 缩小屏幕工作区，其他窗口被挤走）→ 隐藏最小化/置顶按钮
+    //   退出：取消 AppBar → 恢复备份布局 + 窗口 bounds → 恢复按钮
+    //   T/B：在顶端（horizontalFull）/ 底端（horizontalBottom）之间切换
+    void enterStickMode();
+    void exitStickMode();
+    void toggleStickTopBottom();
+#endif
+
     // 把顶层窗口调整到目标尺寸（居中于当前屏幕 userArea），处理 resizeLimits
     // 放开/锁定、standalone setBounds（含边框）与插件 setSize 的差异，并反推
     // overhead 使 canvas 高度对齐到 8px 网格。返回对齐后的 canvas 区域。
@@ -400,6 +414,18 @@ private:
     bool lockButtonPressed    = false;
     bool alwaysOnTopActive    = true;  // 固定按钮当前状态：默认启用（置顶不被遮挡）
     bool layoutLocked         = false; // v1.8.3：布局锁定态（抱锁后不可拖动/resize）
+
+    // stick 模式是否激活（Windows 专属；非 Windows 恒 false，供 paint 判断隐藏按钮）
+    bool stickActive = false;
+
+#if JUCE_WINDOWS
+    // ---- stick 模式状态（Windows 专属）----
+    bool                 stickBottomAligned  = false;  // false=T(顶), true=B(底)
+    juce::ValueTree      stickBackupLayout;            // 进入 stick 前的模块布局备份
+    juce::Rectangle<int> stickBackupWindowBounds;       // 进入 stick 前的窗口 bounds 备份
+    // 进入 stick 前 constrainer 的 resizeLimits（退出时恢复宽度锁定）
+    int stickSavedMinW = 0, stickSavedMinH = 0, stickSavedMaxW = 0, stickSavedMaxH = 0;
+#endif
 
     // v1.8.3：布局锁定前记住的 resize 上下限，锁定时用当前尺寸夹紧、解锁时还原。
     //   · 走 setResizeLimits 而非 setResizable —— 后者会 recreateDesktopWindow

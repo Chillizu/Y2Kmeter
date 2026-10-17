@@ -552,6 +552,36 @@ ModuleWorkspace::ModuleWorkspace()
     };
     addAndMakeVisible (loadPresetBtn);
 
+#if JUCE_WINDOWS
+    // stick 模式按钮（Windows 专属：AppBar 硬 stick 驻留）
+    //   · STICK：进入 stick（未激活时显示）
+    //   · X：退出 stick；T/B：顶/底切换（激活时显示，STICK 隐藏）
+    stickBtn.setButtonText ("Stick");
+    stickBtn.setTooltip ("Enter stick mode: dock to the top screen edge and shrink "
+                         "the work area (like the taskbar)");
+    stickBtn.onClick = [this]()
+    {
+        if (onStickClicked) onStickClicked();
+    };
+    addAndMakeVisible (stickBtn);
+
+    stickExitBtn.setButtonText ("X");
+    stickExitBtn.setTooltip ("Exit stick mode and restore the previous layout");
+    stickExitBtn.onClick = [this]()
+    {
+        if (onStickExitClicked) onStickExitClicked();
+    };
+    addChildComponent (stickExitBtn);
+
+    stickToggleBtn.setButtonText ("T/B");
+    stickToggleBtn.setTooltip ("Switch stick position between Top and Bottom");
+    stickToggleBtn.onClick = [this]()
+    {
+        if (onStickToggleClicked) onStickToggleClicked();
+    };
+    addChildComponent (stickToggleBtn);
+#endif
+
     // 订阅主题变更：切换主题后 PinkXP::ink 已改变，但 Label 的 textColour
     //   是缓存值（JUCE Label 用存储的 Colour 绘制），必须显式刷新，否则
     //   在暗色主题下 Label 仍显示"bubblegum 的深色 ink"，在黑底上看不清。
@@ -2390,6 +2420,35 @@ void ModuleWorkspace::resized()
                 tb.removeFromRight (6);
         }
 
+#if JUCE_WINDOWS
+        // stick 按钮组（Windows 专属）：贴在 Save/Load 左侧、themeBar 右侧
+        //   · 未激活：显示 "Stick"；激活：显示 "X"（退出）+ "T/B"（顶/底切换）
+        if (stickActive)
+        {
+            tb.removeFromRight (4);
+            auto toggleArea = tb.removeFromRight (btnW);
+            stickToggleBtn.setBounds (toggleArea.withSizeKeepingCentre (btnW, btnH));
+            stickToggleBtn.setVisible (true);
+
+            tb.removeFromRight (4);
+            auto exitArea = tb.removeFromRight (btnW);
+            stickExitBtn.setBounds (exitArea.withSizeKeepingCentre (btnW, btnH));
+            stickExitBtn.setVisible (true);
+
+            stickBtn.setVisible (false);
+        }
+        else
+        {
+            tb.removeFromRight (6);
+            auto stickArea = tb.removeFromRight (btnW);
+            stickBtn.setBounds (stickArea.withSizeKeepingCentre (btnW, btnH));
+            stickBtn.setVisible (true);
+
+            stickExitBtn.setVisible   (false);
+            stickToggleBtn.setVisible (false);
+        }
+#endif
+
         fpsBtn.setVisible   (true);
         fpsLabel.setVisible (true);
 
@@ -2643,6 +2702,20 @@ void ModuleWorkspace::setLayoutPresetUiVisible (bool shouldBeVisible)
         if (! saveLoadUiVisible)
             toolbarDividerXLayout = -1;
     }
+
+    resized();
+    repaint();
+}
+
+void ModuleWorkspace::setStickActive (bool active)
+{
+    if (stickActive == active) return;
+    stickActive = active;
+
+    // 未激活显示 STICK，激活显示 X + T/B（STICK 隐藏）
+    stickBtn.setVisible       (! active);
+    stickExitBtn.setVisible   (active);
+    stickToggleBtn.setVisible (active);
 
     resized();
     repaint();

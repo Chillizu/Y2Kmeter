@@ -220,7 +220,7 @@ protected:
     bool popOutButtonPressed_ = false;
 
 private:
-    enum class Edge { none, right, bottom, bottomRight };
+    enum class Edge { none, left, right, top, bottom, topLeft, topRight, bottomLeft, bottomRight };
 
     Edge detectEdge(juce::Point<int> pos) const;
     void updateCursorFor(Edge e);
@@ -520,6 +520,11 @@ public:
     //   · 默认 true（Standalone 模式保持原行为）。
     void setLayoutPresetUiVisible (bool shouldBeVisible);
 
+    // stick 模式状态（Windows 专属）：切换底部 toolbar 的 stick 按钮组显示。
+    //   · 未激活：显示 "STICK" 按钮；激活：显示 "X"（退出）+ "T/B"（顶/底切换）。
+    //   · 由 Editor 在 enterStickMode / exitStickMode 里调用。
+    void setStickActive (bool active);
+
     // 控制"布局预设 Save / Load"两个按钮的独立可见性（与布局预设下拉互相解耦）。
     //   · 用于 VST3 / AU 等插件模式：DAW 里我们仍然要让用户能 Save/Load 预设文件
     //     （与 Standalone 的 .settings 互通），但布局预设下拉因为会改顶层窗口尺寸
@@ -596,6 +601,11 @@ public:
     // ======================================================
     std::function<void(juce::File)> onSavePresetRequested;
     std::function<void(juce::File)> onLoadPresetRequested;
+
+    // stick 模式回调（Windows 专属）：STICK 按钮进入 / X 退出 / T-B 顶底切换
+    std::function<void()> onStickClicked;
+    std::function<void()> onStickExitClicked;
+    std::function<void()> onStickToggleClicked;
 
     // 模块添加回调：每当 addModule() 成功添加一个模块时触发
     //   · 参数为已添加模块的引用（面板已挂载、已 makeVisible）
@@ -850,6 +860,14 @@ private:
     //     把选中的 File 传给 Editor → Standalone App 去做真正的复制 / 重载。
     juce::TextButton savePresetBtn;
     juce::TextButton loadPresetBtn;
+
+    // stick 模式按钮（Windows 专属：AppBar 硬 stick 驻留）
+    //   · STICK：进入 stick（未激活时显示）
+    //   · X：退出 stick；T/B：顶/底切换（激活时显示，STICK 隐藏）
+    juce::TextButton stickBtn;
+    juce::TextButton stickExitBtn;
+    juce::TextButton stickToggleBtn;
+    bool             stickActive = false;
 
     // 添加模块菜单（双击 / 右键空白区）hover 预览状态
     //   · 当用户在 PopupMenu 里悬停在某一模块名上时，在 canvas 的 hoverPreviewPos
