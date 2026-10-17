@@ -843,6 +843,41 @@ private:
     bool             gainPopupVisible = false;
     float            inputGainDb      = 0.0f;
 
+    // 拖动中标志。
+    //   · 拖拽期间禁止对 gainSlider 做 setVisible(false) / setBounds()：
+    //     JUCE 的鼠标拖拽一旦遇到组件被隐藏或移动，捕获状态会残留，
+    //     表现为整个界面不再响应鼠标（Hide 态下 30Hz 悬停轮询收起浮层时
+    //     正好会触发这条路径，是"拖 gain 卡死"的根因）。
+    bool             gainSliderDragging = false;
+
+    // gain 弹出控制条的底板：凸起面板 + 0dB 参考线 + 右侧 dB 数值。
+    //   · 用独立子组件承载，而不是在 paintOverChildren() 里手绘：
+    //     旧做法把底板画在 paintOverChildren（层级在子组件之上），因此必须
+    //     再手动把 slider 重画一遍盖回去，且入口条件写的是 chromeVisible ——
+    //     Hide 浮层态下 chromeVisible 恒为 false，底板整段被跳过，
+    //     于是只剩轨道和控制头，边框与轮廓全部丢失。
+    //   · 改为子组件后，层级由 z-order 保证，常驻态 / Hide 浮层态行为一致。
+    struct GainPopupBackdrop : public juce::Component
+    {
+        explicit GainPopupBackdrop (ModuleWorkspace& o) : owner (o)
+        {
+            // 不拦截鼠标：点击落在底板上时应冒泡给 workspace（等同"点外部关闭"）
+            setInterceptsMouseClicks (false, false);
+        }
+        void paint (juce::Graphics& g) override;
+        ModuleWorkspace& owner;
+    };
+    std::unique_ptr<GainPopupBackdrop> gainPopupBackdrop;
+
+    // 弹窗底板矩形（含右侧数值区），供 resized() 与 setGainPopupVisible() 共用
+    juce::Rectangle<int> getGainPopupBounds() const;
+
+public:
+    // Hide 浮层态下 Editor 的 30Hz 悬停轮询需要知道"用户正按着 gain 滑块"，
+    //   否则可能在拖拽中途收起浮层 → 弹窗被隐藏 → 鼠标捕获残留 → 界面卡死。
+    bool isGainSliderDragging() const noexcept { return gainSliderDragging; }
+private:
+
     // ------------------------------------------------------------
     // gainPopup 全局点击外部关闭监听器
     //   · popup 打开时 attach 到 juce::Desktop 的全局 MouseListener

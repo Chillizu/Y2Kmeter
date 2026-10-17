@@ -4266,10 +4266,14 @@ void Y2KmeterAudioProcessorEditor::updateChromeReveal()
     else
         revealArmed = true;
 
-    // 正在交互（按住鼠标拖拽 / 下拉菜单、对话框打开）时维持当前状态，
+    // 正在交互（按住鼠标拖拽 / 下拉菜单、对话框打开 / 正在拖 gain 滑块）时维持当前状态，
     //   避免拖窗口或选菜单项的过程中浮层突然消失。
+    //   注：ModifierKeys::getCurrentModifiersRealtime() 在 macOS 上由定时器读取时
+    //   并不总能反映"按钮仍按住"，因此额外用 workspace 自己的拖动状态兜底 ——
+    //   否则收起浮层会在拖拽中途隐藏 gain 弹窗，导致界面失去鼠标响应。
     const bool busy = juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown()
-                      || juce::ModalComponentManager::getInstance()->getNumModalComponents() > 0;
+                      || juce::ModalComponentManager::getInstance()->getNumModalComponents() > 0
+                      || (workspace != nullptr && workspace->isGainSliderDragging());
     if (busy)
         return;
 

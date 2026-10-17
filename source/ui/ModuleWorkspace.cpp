@@ -404,12 +404,27 @@ ModuleWorkspace::ModuleWorkspace()
             return;
 
         inputGainDb = db;
-        gainBtn.setTooltip ("Input gain (" + juce::String (inputGainDb, 1) + " dB)");
+        // 拖动过程中不刷新 tooltip：tooltip 在拖拽时本就不可见，逐帧 setTooltip
+        //   会给 TooltipWindow 制造大量无谓的失效与重算。
+        if (! gainSliderDragging)
+            gainBtn.setTooltip ("Input gain (" + juce::String (inputGainDb, 1) + " dB)");
         if (onInputGainChanged)
             onInputGainChanged (inputGainDb);
 
         notifyLayoutChanged();
         repaint();
+    };
+    // 拖拽生命周期：拖动期间禁止隐藏弹窗 / 重设 bounds（见头文件 gainSliderDragging 注释）
+    gainSlider.onDragStart = [this]() { gainSliderDragging = true; };
+    gainSlider.onDragEnd = [this]()
+    {
+        gainSliderDragging = false;
+
+        // 拖动中被延后的关闭请求在这里补齐：若此刻工具栏本就不该显示，收起弹窗。
+        if (! isToolbarShown())
+            setGainPopupVisible (false);
+
+        gainBtn.setTooltip ("Input gain (" + juce::String (inputGainDb, 1) + " dB)");
     };
     addChildComponent (gainSlider);
 
@@ -654,10 +669,18 @@ ModuleWorkspace::~ModuleWorkspace()
 // ----------------------------------------------------------
 void ModuleWorkspace::setGainPopupVisible (bool shouldBeVisible)
 {
+    // 拖动滑块期间禁止关闭：中途 setVisible(false) 会让 JUCE 的鼠标捕获状态残留，
+    //   之后整个界面不再响应鼠标（Hide 态悬停轮询收起浮层时正好会走到这里）。
+    //   拖动结束后由 slider.onDragEnd 重新评估是否需要收起。
+    if (! shouldBeVisible && gainSliderDragging)
+        return;
+
     if (gainPopupVisible == shouldBeVisible)
     {
-        // 即便状态未变，也保底同步一次 slider 的可见性（防御性）
+        // 即便状态未变，也保底同步一次可见性（防御性）
         gainSlider.setVisible (shouldBeVisible);
+        if (gainPopupBackdrop != nullptr)
+            gainPopupBackdrop->setVisible (shouldBeVisible);
         return;
     }
 
@@ -666,7 +689,20 @@ void ModuleWorkspace::setGainPopupVisible (bool shouldBeVisible)
 
     if (shouldBeVisible)
     {
+        // 底板子组件：只在"要显示"时懒创建。
+        //   隐藏路径经常由 resized() 内部触发，此时新增子组件会再引发一次
+        //   子组件结构变更 / 重排，属于不必要的重入风险，因此放到显示分支。
+        if (gainPopupBackdrop == nullptr)
+        {
+            gainPopupBackdrop = std::make_unique<GainPopupBackdrop> (*this);
+            addChildComponent (*gainPopupBackdrop);
+        }
+
+        gainPopupBackdrop->setBounds (getGainPopupBounds());
+        gainPopupBackdrop->setVisible (true);
+        gainPopupBackdrop->toFront (false);
         gainSlider.toFront (false);
+
         // 挂到 topLevel 的 MouseListener 上，wantsEventsForAllNestedChildComponents=true
         //   → 该窗口内任何 Component 的鼠标事件都会再冒泡给我们，成本仅在本窗口局部。
         if (! gainPopupListenerAttached)
@@ -682,6 +718,9 @@ void ModuleWorkspace::setGainPopupVisible (bool shouldBeVisible)
     }
     else
     {
+        if (gainPopupBackdrop != nullptr)
+            gainPopupBackdrop->setVisible (false);
+
         if (gainPopupListenerAttached)
         {
             if (gainPopupListenerHost != nullptr)
@@ -694,10 +733,58 @@ void ModuleWorkspace::setGainPopupVisible (bool shouldBeVisible)
     repaint();
 }
 
+// ----------------------------------------------------------
+// gain 弹窗底板几何 & 绘制
+// ----------------------------------------------------------
+juce::Rectangle<int> ModuleWorkspace::getGainPopupBounds() const
+{
+    constexpr int valueW   = 56;
+    constexpr int valueGap = 2;
+
+    auto popup = gainSlider.getBounds().expanded (8, 6);
+    popup = popup.withRight (popup.getRight() + valueGap + valueW);
+    popup = popup.withHeight (30).withY (gainBtn.getY() - 34);
+    return popup;
+}
+
+void ModuleWorkspace::GainPopupBackdrop::paint (juce::Graphics& g)
+{
+    const auto local = getLocalBounds();
+
+    // 凸起面板（2px 硬边框 + 高光/暗影），XP 风格
+    PinkXP::drawRaised (g, local, PinkXP::btnFace);
+
+    // 0 dB 参考竖线：slider 是后加的子组件，会盖在上层，因此这里画在它下面
+    const auto sb = owner.gainSlider.getBounds() - getPosition();
+    if (! sb.isEmpty())
+    {
+        const int zeroX = sb.getX()
+                        + (int) std::round (owner.gainSlider.getPositionOfValue (0.0)) - 1;
+
+        g.setColour (PinkXP::ink.withAlpha (0.65f));
+        g.fillRect (zeroX, sb.getY() - 2, 1, sb.getHeight() + 4);
+        g.setColour (PinkXP::hl.withAlpha (0.70f));
+        g.fillRect (zeroX + 1, sb.getY() - 2, 1, sb.getHeight() + 4);
+    }
+
+    // 右侧 dB 数值
+    constexpr int valueW = 56;
+    auto valueArea = local.withTrimmedRight (10).removeFromRight (valueW);
+
+    g.setColour (PinkXP::ink.withAlpha (0.92f));
+    g.setFont (PinkXP::getFont (10.0f, juce::Font::plain));
+    g.drawText (juce::String (owner.inputGainDb, 1) + " dB",
+                valueArea, juce::Justification::centredRight, false);
+}
+
 void ModuleWorkspace::GainPopupDismissListener::mouseDown (const juce::MouseEvent& e)
 {
     // popup 已不在显示状态时直接忽略（理论上不会命中：关闭时已 detach）
     if (! owner.gainPopupVisible)
+        return;
+
+    // 拖动滑块期间的任何点击都不关闭（防御：避免拖拽中弹窗被收起）
+    if (owner.gainSliderDragging)
         return;
 
     // 屏蔽"点击 gain 按钮本身"—— 按钮的 onClick 会自己 toggle popup，
@@ -1929,6 +2016,11 @@ void ModuleWorkspace::raiseToolbarOverlay()
     }
 
     toolbarBackdrop->toFront (false);
+
+    // gain 弹窗底板必须在 slider 之下、但在工具栏之上
+    if (gainPopupBackdrop != nullptr && gainPopupBackdrop->isVisible())
+        gainPopupBackdrop->toFront (false);
+
     for (auto* c : toolbarComps)
         c->toFront (false);
     if (customThemePicker.isShowing())
@@ -2207,47 +2299,10 @@ void ModuleWorkspace::paintOverChildren (juce::Graphics& g)
         }
     }
 
-    // gain 弹出控制条：只包含控制条 + 右侧数值，放在 paintOverChildren 确保层级高于模块
-    if (chromeVisible && gainPopupVisible && gainBtn.isVisible() && gainSlider.isVisible())
-    {
-        constexpr int valueW = 56;
-        constexpr int valueGap = 2;
-
-        auto popupBounds = gainSlider.getBounds().expanded (8, 6);
-        popupBounds = popupBounds.withRight (popupBounds.getRight() + valueGap + valueW);
-        popupBounds = popupBounds.withHeight (30).withY (gainBtn.getY() - 34);
-
-        // 不透明底板（覆盖在最上层）
-        PinkXP::drawRaised (g, popupBounds, PinkXP::btnFace);
-
-        auto textArea = popupBounds;
-        textArea.removeFromRight (valueGap);
-        auto valueArea = textArea.removeFromRight (valueW);
-
-        // 0 dB 参考竖线：画在 0dB 对应滑块中心位置（位于滑块下层）
-        {
-            const auto sb = gainSlider.getBounds();
-            const int zeroX = gainSlider.getX() + (int) std::round (gainSlider.getPositionOfValue (0.0)) - 1;
-
-            g.setColour (PinkXP::ink.withAlpha (0.65f));
-            g.fillRect (zeroX, sb.getY() - 2, 1, sb.getHeight() + 4);
-            g.setColour (PinkXP::hl.withAlpha (0.70f));
-            g.fillRect (zeroX + 1, sb.getY() - 2, 1, sb.getHeight() + 4);
-        }
-
-        // 重新绘制 slider，保证轨道与滑块位于最上层且不受底板遮挡
-        {
-            juce::Graphics::ScopedSaveState save (g);
-            g.reduceClipRegion (gainSlider.getBounds().expanded (1));
-            g.setOrigin (gainSlider.getPosition());
-            gainSlider.paintEntireComponent (g, true);
-        }
-
-        // 当前值画在同一块控制条板子的右侧区域
-        g.setColour (PinkXP::ink.withAlpha (0.92f));
-        g.setFont (PinkXP::getFont (10.0f, juce::Font::plain));
-        g.drawText (juce::String (inputGainDb, 1) + " dB", valueArea.translated (-10, 0), juce::Justification::centredRight, false);
-    }
+    // 注：gain 弹出控制条的底板已改为独立子组件 GainPopupBackdrop，
+    //   层级由 z-order 保证（底板 → slider），不再在 paintOverChildren 里手绘。
+    //   旧实现在这里用 chromeVisible 作为入口条件（Hide 浮层态恒为 false），
+    //   导致弹窗只剩轨道与控制头、边框轮廓丢失。
 
     if (! hoverPreviewActive)
         return;
@@ -2352,7 +2407,22 @@ void ModuleWorkspace::resized()
 
             // 左对齐：左侧仅保留最小内边距；右侧预留紧凑数值区
             auto sliderArea = popup.reduced (8, 6).withTrimmedRight (58);
-            gainSlider.setBounds (sliderArea);
+
+            // 拖动中不改 slider bounds：中途移动被拖拽的组件会让 JUCE 的
+            //   鼠标捕获状态错乱，进而整个界面失去响应。
+            if (! gainSliderDragging)
+            {
+                gainSlider.setBounds (sliderArea);
+
+                if (gainPopupBackdrop != nullptr)
+                {
+                    gainPopupBackdrop->setBounds (getGainPopupBounds());
+                    gainPopupBackdrop->setVisible (gainPopupVisible);
+                    if (gainPopupVisible)
+                        gainPopupBackdrop->toFront (false);
+                }
+            }
+
             gainSlider.setVisible (gainPopupVisible);
             if (gainPopupVisible)
                 gainSlider.toFront (false);
