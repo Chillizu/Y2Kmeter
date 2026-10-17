@@ -1,5 +1,5 @@
 #define MyAppName      "Y2Kmeter"
-#define MyAppVersion   "2.8.1"
+#define MyAppVersion   "2.8.5"
 #define MyAppPublisher "iisaacbeats.cn"
 #define MyAppExeName   "Y2Kmeter.exe"
 #define MyPluginBundle "Y2Kmeter.vst3"
@@ -92,7 +92,7 @@ Type: filesandordirs; Name: "{commoncf}\VST3\iisaacbeats.cn\{#MyPluginBundle}\Co
 ; -----------------------------------------------------------------------
 [Files]
 ; Standalone EXE
-Source: "cmake-build-release-visual-studio\Y2Kmeter_artefacts\Release\Standalone\{#MyAppExeName}"; \
+Source: "build\msvc\Y2Kmeter_artefacts\Release\Standalone\{#MyAppExeName}"; \
     DestDir: "{app}"; \
     Flags: ignoreversion; \
     Components: standalone
@@ -106,11 +106,11 @@ Source: "assets\virtupet_assets.zip"; \
     Components: standalone
 
 ; Standalone Milkdrop 运行时 DLL（projectM 渲染库 + OpenGL 扩展加载器）
-Source: "cmake-build-release-visual-studio\Y2Kmeter_artefacts\Release\Standalone\projectM-4.dll"; \
+Source: "build\msvc\Y2Kmeter_artefacts\Release\Standalone\projectM-4.dll"; \
     DestDir: "{app}"; \
     Flags: ignoreversion; \
     Components: standalone
-Source: "cmake-build-release-visual-studio\Y2Kmeter_artefacts\Release\Standalone\glew32.dll"; \
+Source: "build\msvc\Y2Kmeter_artefacts\Release\Standalone\glew32.dll"; \
     DestDir: "{app}"; \
     Flags: ignoreversion; \
     Components: standalone
@@ -137,7 +137,7 @@ Source: "assets\milkdrop_textures.zip"; \
 ;   v2.3.1: 排除 milkdrop_presets/ 和 milkdrop_textures/，预设和纹理已集中存放于
 ;   %APPDATA%\Y2Kmeter\，Standalone 和 VST3 共享同一份，不再随 bundle 冗余分发。
 ; DestDir 走 [Code] 段 GetVst3Dir —— 用户在独立向导页里选择的路径
-Source: "cmake-build-release-visual-studio\Y2Kmeter_artefacts\Release\VST3\{#MyPluginBundle}\*"; \
+Source: "build\msvc\Y2Kmeter_artefacts\Release\VST3\{#MyPluginBundle}\*"; \
     DestDir: "{code:GetVst3Dir}\{#MyPluginBundle}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs; \
     Excludes: "milkdrop_presets\*;milkdrop_textures\*"; \
@@ -145,7 +145,7 @@ Source: "cmake-build-release-visual-studio\Y2Kmeter_artefacts\Release\VST3\{#MyP
 
 ; Y2Kmeter_milkdrop（Milkdrop-only VST3 变体，独立插件，与完整版同装到 VST3 目录）
 ;   · 预设/纹理与完整版共享 AppData，bundle 内不携带
-Source: "cmake-build-release-visual-studio\Y2Kmeter_milkdrop_artefacts\Release\VST3\{#MyPluginBundleMilkdrop}\*"; \
+Source: "build\msvc\Y2Kmeter_milkdrop_artefacts\Release\VST3\{#MyPluginBundleMilkdrop}\*"; \
     DestDir: "{code:GetVst3Dir}\{#MyPluginBundleMilkdrop}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs; \
     Components: vst3

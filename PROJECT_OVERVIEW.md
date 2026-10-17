@@ -3723,4 +3723,48 @@ Milkdrop 脱离态由 `GLView` 自己的本地 OpenGL 线程驱动渲染。切�
 
 ---
 
+## v2.8.5：窗口行为模型重构（L / Hide / Stick 解耦）
+
+> 详细设计与测试清单见 [`docs/Window_Behavior_Model_v2.8.5.md`](docs/Window_Behavior_Model_v2.8.5.md)。
+
+v2.8.1 引入 Stick（AppBar 驻留）后，与既有的 Hide、L（锁定）共用同一批窗口几何手段，产生交叉污染：
+
+- Stick + Hide：鼠标每次移入窗口，窗口向下闪一下再恢复（后期恶化为连续多次闪现）；
+- Hide + L：开 Hide 后关 L，窗口拖不动，强行拖动会闪回原位。
+
+本轮把三者职责彻底拆开，不再共用 `setResizeLimits` / `setBounds`：
+
+### 1. L 改为纯交互闸门
+
+- `applyLayoutLocked()` 不再调用 `setResizeLimits`、不再移动窗口，只同步 workspace / 浮动窗口并调用新增的 `applyUserResizeGate()`。
+- `applyUserResizeGate()` 关闭 `ResizableCornerComponent` / `ResizableBorderComponent` 的鼠标响应并置 alpha=0；`childrenChanged()` 里重套一次（`setResizeLimits` 会重建手柄）。
+- 拖窗、双击伪全屏在 `layoutLocked` 下早退。
+
+### 2. Hide 改为「一次性几何收缩 + 悬停浮层」
+
+- 进入/退出 Hide 基于当前窗口一次性 ± `getChromeHeightPx()`（= `ui(26) + ui(36)`），锚点：Stick 用驻留边，否则上半屏贴顶 / 下半屏贴底。
+- 悬停不再 resize 窗口：工具栏以浮层盖在模块上（`ModuleWorkspace::setToolbarOverlayRevealed` + `ToolbarOverlayBackdrop`），标题栏在 `paintOverChildren()` 里画；`setOverlayPassThroughRect` 让点击穿透到 Editor。
+- 悬停检测改为 30Hz 轮询 `updateChromeReveal()`（离开 250ms 宽限、鼠标按下/modal 保持、点完 Hide 需先离开一次），彻底移除旧 `onChromeVisibleChanged` 状态机与 `onMouseEntered/Moved/Exited` 回调，以及 timer 里的「焦点保护」自动 show/hide。
+
+### 3. Stick 去掉 constraining 反弹
+
+- 根因：`ResizableWindow` 默认 `setMinimumOnscreenAmounts(0x10000,16,24,16)` 要求顶边落在 `userArea` 内，而 Stick 后 userArea 已被自身占位压缩 → 任何 `setBoundsConstrained` 都把窗口推到 `y = 占位厚度`。
+- 新增 `setStickOnscreenRelaxed()`：Stick 期间清零这四个量，退出时还原。
+- 新增 `redockStickAfterGeometryChange()`：Hide 切换等几何变化后立即重提交占位。
+- `enter/exit/toggleStickTopBottom` 在 Hide 态下采用「展开 → 执行 → 再收起」包裹，保证备份 bounds/limits 永远是 Show 态值。
+
+### 4. 其他
+
+- `ModuleWorkspace`：工具栏显示条件收敛为 `isToolbarShown()`；Hide 态隐藏 Stick / Hide 按钮；模块 `toFront()` 后按状态 `raiseToolbarOverlay()`。
+- `toggleFakeFullScreen()` 退出路径不再处理 `savedLock*`（L 不再改 limits）。
+- 存档键 `ui.chromeVisible` / `layoutLocked` / `window.{x,y,w,h}` 语义全部不变，老用户存档可直接沿用。
+
+### 5. 版本号与构建
+
+- 2.8.1 → 2.8.5（`CMakeLists.txt` 三处 / `Y2Kmeter_installer.iss` / `README.md` / `PluginEditor.cpp` 四处字面量）。
+- `Y2Kmeter_installer.iss` 的 `Source` 路径由 `cmake-build-release-visual-studio\` 更新为当前预设的 `build\msvc\`。
+- **踩坑**：只改 `CMakeLists.txt` 版本号后直接 `cmake --build --target ...` 不会重写 JUCE 生成的 `*_resources.rc`（EXE 版本信息仍是旧值）；必须先 `cmake --preset msvc` 重新 configure，必要时删除 `build/msvc/*/JuceLibraryCode/*_resources.rc` 触发重新生成。
+
+---
+
 *本文档随着代码演进需要同步更新；若你（AI）在会话中发现文档描述与代码不一致，请以代码为准，并提示用户可能需要同步更新本文。*

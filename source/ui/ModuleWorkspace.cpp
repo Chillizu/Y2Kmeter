@@ -344,30 +344,9 @@ ModuleWorkspace::ModuleWorkspace()
     hideBtn.setDimWhenIdle(false);
     hideBtn.onClick = [this]()
     {
-        if (autoHideActive)
-        {
-            // v1.8.6：auto-hide 模式下点击 "Show" 按钮应退出 auto-hide。
-            // 先复位 autoHideActive 标志，再通过 false→true 双拍强制触发
-            // Editor 的 onChromeVisibleChanged(true) 退出路径。
-            // 注意：单次 setChromeVisible(true) 在 hover-show 状态下
-            // （chrome 已可见）会被 early return 吞掉，必须经过 false 中间态。
-            autoHideActive = false;
-            if (chromeVisible)
-            {
-                // hover-show 状态：先隐再显，触发退出路径
-                setChromeVisible(false);
-                setChromeVisible(true);
-            }
-            else
-            {
-                // 纯隐藏状态：直接显式即触发退出路径
-                setChromeVisible(true);
-            }
-        }
-        else
-        {
-            setChromeVisible(!chromeVisible);
-        }
+        // v2.8.2：Hide 态下 chromeVisible 恒为 false（悬停只显示浮层，不翻转 chromeVisible），
+        //   因此 Hide/Show 统一为一次简单翻转；进入/退出 Hide 的副作用全部由 Editor 处理。
+        setChromeVisible (! chromeVisible);
     };
     addAndMakeVisible(hideBtn);
 
@@ -976,12 +955,13 @@ void ModuleWorkspace::hookPanel(ModulePanel& panel)
         }
 #endif
 
-        // hideBtn 始终保持在最上层：模块 mouseDown 会调 toFront(true) 把自己
-        // 移到 child 列表末尾（z-order 最顶），此时 hideBtn 会被压在下面。
-        // 这里在模块冒前之后再把 hideBtn 拉回最顶，保证用户无论聚焦哪个模块
-        // （尤其是 chrome 隐藏 + 窗口收缩后重叠在 hideBtn 上的模块）都能看到并
-        // 点到 hideBtn / Show 按钮，避免"找不到 Show 按钮"的尴尬。
-        hideBtn.toFront (false);
+        // 工具栏始终在模块之上：模块 mouseDown 会 toFront(true) 把自己冒到最顶。
+        //   · 常驻态：canvas 不含工具栏条带，只需保证 hideBtn 在上；
+        //   · Hide 浮层显示中：整条浮层工具栏重新提到最顶。
+        if (toolbarOverlayRevealed)
+            raiseToolbarOverlay();
+        else
+            hideBtn.toFront (false);
     };
 
 }
@@ -1859,6 +1839,102 @@ void ModuleWorkspace::rebuildCanvasBgCacheIfNeeded()
     canvasBgCacheThemeId = currentThemeId;
 }
 
+// ----------------------------------------------------------
+// 工具栏背景（常驻态在 paint() 里画；Hide 浮层态由 toolbarBackdrop 画在模块之上）
+// ----------------------------------------------------------
+void ModuleWorkspace::paintToolbarBackground (juce::Graphics& g, juce::Rectangle<int> tb)
+{
+    if (tb.isEmpty())
+        return;
+
+    PinkXP::drawRaised (g, tb, PinkXP::btnFace);
+
+    // Toolbar 内的小竖线分隔符（XP 风格：1px 暗色 + 1px 高光色构成凹槽效果）
+    auto drawDivider = [&] (int x)
+    {
+        if (x < 0) return;
+        const int y1 = tb.getY()      + 6;
+        const int y2 = tb.getBottom() - 6;
+        g.setColour (PinkXP::shdw);
+        g.fillRect (x,     y1, 1, y2 - y1);
+        g.setColour (PinkXP::hl);
+        g.fillRect (x + 1, y1, 1, y2 - y1);
+    };
+    drawDivider (toolbarDividerX0);
+    drawDivider (toolbarDividerX1);
+    drawDivider (toolbarDividerX2);
+    drawDivider (toolbarDividerX3);
+    drawDivider (toolbarDividerXLayout);
+}
+
+void ModuleWorkspace::ToolbarOverlayBackdrop::paint (juce::Graphics& g)
+{
+    // backdrop 与 workspace 坐标原点不同：分隔线 x 是 workspace 坐标，平移到本地
+    g.addTransform (juce::AffineTransform::translation ((float) -getX(), (float) -getY()));
+    owner.paintToolbarBackground (g, getBounds());
+}
+
+void ModuleWorkspace::setToolbarOverlayRevealed (bool revealed)
+{
+    // 常驻态没有浮层概念
+    if (chromeVisible || minimalMode_)
+        revealed = false;
+
+    if (toolbarOverlayRevealed == revealed)
+        return;
+
+    toolbarOverlayRevealed = revealed;
+
+    if (toolbarBackdrop == nullptr)
+    {
+        toolbarBackdrop = std::make_unique<ToolbarOverlayBackdrop> (*this);
+        addChildComponent (*toolbarBackdrop);
+    }
+
+    if (! revealed)
+    {
+        setGainPopupVisible (false);
+        if (customThemePicker.isShowing())
+            customThemePicker.dismiss();
+    }
+
+    // canvas 不受影响（只看 chromeVisible），因此 resized() 不会移动/夹紧任何模块
+    resized();
+    repaint (getToolbarArea());
+}
+
+void ModuleWorkspace::raiseToolbarOverlay()
+{
+    if (! toolbarOverlayRevealed || toolbarBackdrop == nullptr)
+        return;
+
+    // 已经在最顶层（最后一个子组件是工具栏控件）就不重复排序，避免无谓重绘
+    juce::Component* toolbarComps[] = {
+        &themeBar, &audioSourceLabel, &audioSourceBox, &fpsLabel, &fpsBtn,
+        &gridBtn, &layoutPresetBox, &savePresetBtn, &loadPresetBtn,
+        &stickBtn, &stickExitBtn, &stickToggleBtn,
+        &gainBtn, &hideBtn, &gainSlider
+    };
+
+    const int n = getNumChildComponents();
+    if (n > 0 && getChildComponent (n - 1) == toolbarComps[juce::numElementsInArray (toolbarComps) - 1])
+    {
+        // 末位已是工具栏控件：再确认没有模块插在 backdrop 之后
+        const int backdropIdx = getIndexOfChildComponent (toolbarBackdrop.get());
+        bool moduleAbove = false;
+        for (int i = backdropIdx + 1; i < n && ! moduleAbove; ++i)
+            moduleAbove = dynamic_cast<ModulePanel*> (getChildComponent (i)) != nullptr;
+        if (! moduleAbove)
+            return;
+    }
+
+    toolbarBackdrop->toFront (false);
+    for (auto* c : toolbarComps)
+        c->toFront (false);
+    if (customThemePicker.isShowing())
+        customThemePicker.toFront (false);
+}
+
 void ModuleWorkspace::paint(juce::Graphics& g)
 {
     if (chromeVisible)
@@ -1874,31 +1950,10 @@ void ModuleWorkspace::paint(juce::Graphics& g)
         }
 
         // 底部工具栏：凸起面板（深色主题下也保持浅色底，让文字/色票可读）
-        auto tb = getToolbarArea();
-        PinkXP::drawRaised(g, tb, PinkXP::btnFace);
-
-        // Toolbar 内的小竖线分隔符（XP 风格：1px 暗色 + 1px 高光色构成凹槽效果）
-        //   分隔 FPS 区 / Source 区 / Hide 区
-        auto drawDivider = [&](int x)
-        {
-            if (x < 0) return;
-            // 竖线高度略小于 toolbar 高度（上下各留 6px 呼吸空间）
-            const int y1 = tb.getY()      + 6;
-            const int y2 = tb.getBottom() - 6;
-            g.setColour (PinkXP::shdw);
-            g.fillRect (x,     y1, 1, y2 - y1);
-            g.setColour (PinkXP::hl);
-            g.fillRect (x + 1, y1, 1, y2 - y1);
-        };
-        drawDivider (toolbarDividerX0);
-        drawDivider (toolbarDividerX1);
-        drawDivider (toolbarDividerX2);
-        drawDivider (toolbarDividerX3);
-        drawDivider (toolbarDividerXLayout);
-
-
+        paintToolbarBackground (g, getToolbarArea());
     }
     // else: chrome 隐藏 —— 不画任何背景/工具栏，让 Editor 的桌面底图透过来
+    //   （Hide 浮层的工具栏背景由 toolbarBackdrop 子组件绘制，位于模块之上）
 
     // ------------------------------------------------------
     // 拼豆像素画：在工作区背景之后、子组件（模块）之前绘制。
@@ -2265,9 +2320,8 @@ void ModuleWorkspace::resized()
     // ---- 按钮尺寸（随 UI 密度缩放，低分辨率下更紧凑）----
     const int btnW = PinkXP::ui(52);
     const int btnH = PinkXP::ui(22);
-    constexpr int btnMargin = 6;
 
-    if (chromeVisible && ! minimalMode_)
+    if (isToolbarShown())
     {
         // 底部工具栏：从右到左依次放 hideBtn、音频源下拉 (+Label)、FPS 控件，余下给 themeBar
         auto tb = getToolbarArea().reduced(4, 4);
@@ -2275,6 +2329,7 @@ void ModuleWorkspace::resized()
         // 1) 最右侧：Hide 按钮
         auto btnArea = tb.removeFromRight(btnW + 4);
         hideBtn.setBounds(btnArea.withSizeKeepingCentre(btnW, btnH));
+        hideBtn.setVisible (true);
 
         // 1.5) Gain 按钮（位于 hide 左侧，二者之间有竖直分割线）
         tb.removeFromRight (4);
@@ -2458,7 +2513,9 @@ void ModuleWorkspace::resized()
     }
     else
     {
-        // 隐藏态：themeBar / 音频源下拉 / FPS 控件统统藏起；hideBtn 悬浮在右下角
+        // 隐藏态（Hide 且浮层未显示 / 极简模式）：整条工具栏全部收起。
+        //   v2.8.2：不再在右下角悬浮 Show 按钮 —— 鼠标移入窗口即浮现完整工具栏，
+        //   Show 按钮就在浮层工具栏里，行为与常驻态完全一致。
         themeBar.setVisible(false);
         audioSourceLabel.setVisible (false);
         audioSourceBox.setVisible (false);
@@ -2470,22 +2527,25 @@ void ModuleWorkspace::resized()
         layoutPresetBox.setVisible (false);
         savePresetBtn.setVisible   (false);
         loadPresetBtn.setVisible   (false);
+        stickBtn.setVisible        (false);
+        stickExitBtn.setVisible    (false);
+        stickToggleBtn.setVisible  (false);
+        hideBtn.setVisible         (false);
         toolbarDividerX0 = -1;
         toolbarDividerX1 = -1;
         toolbarDividerX2 = -1;
         toolbarDividerX3 = -1;
         toolbarDividerXLayout = -1;
-        auto r = getLocalBounds();
-        if (minimalMode_)
-        {
-            hideBtn.setVisible(false);
-        }
-        else
-        {
-            hideBtn.setBounds(r.getRight()  - btnW - btnMargin,
-                              r.getBottom() - btnH - btnMargin,
-                              btnW, btnH);
-        }
+    }
+
+    // Hide 浮层背景板：与工具栏同位置，位于模块之上
+    if (toolbarBackdrop != nullptr)
+    {
+        const bool showBackdrop = toolbarOverlayRevealed && isToolbarShown();
+        toolbarBackdrop->setBounds (getToolbarArea());
+        toolbarBackdrop->setVisible (showBackdrop);
+        if (showBackdrop)
+            toolbarBackdrop->repaint();
     }
 
     // 模块自身保留各自 bounds；但要保证不越界（窗口缩小时裁剪）
@@ -2551,8 +2611,11 @@ void ModuleWorkspace::resized()
     //   随窗口尺寸抖动频繁触发的钩子，它不应该永久改写用户数据——就算图片
     //   暂时完全不可见，用户把窗口放大就能重新看到。
 
-    // 按钮始终保持在最上层（避免被模块窗口遮挡）
-    hideBtn.toFront(false);
+    // 工具栏控件始终在模块之上（常驻态只需 hideBtn；Hide 浮层态整条工具栏）
+    if (toolbarOverlayRevealed)
+        raiseToolbarOverlay();
+    else
+        hideBtn.toFront(false);
 
     // P7：窗口尺寸变化 → 画布背景缓存下次 paint 时重建
     canvasBgCacheDirty = true;
@@ -2567,10 +2630,13 @@ void ModuleWorkspace::setChromeVisible(bool shouldBeVisible)
 
     chromeVisible = shouldBeVisible;
 
-    // 按钮文案 + 空闲透明行为切换
-    //   v1.8.6：auto-hide 模式下始终显示 "Show"（点击退出 autoHide）
-    hideBtn.setButtonText((chromeVisible && ! autoHideActive) ? "Hide" : "Show");
-    hideBtn.setDimWhenIdle(! chromeVisible);
+    // 常驻态没有浮层：切回常驻时一并收起浮层状态
+    if (chromeVisible)
+        toolbarOverlayRevealed = false;
+
+    // 按钮文案：Hide 态（只会在浮层工具栏里出现）显示 "Show"
+    hideBtn.setButtonText (chromeVisible ? "Hide" : "Show");
+    hideBtn.setDimWhenIdle (false);
 
     resized();
 
@@ -2606,6 +2672,10 @@ bool ModuleWorkspace::hitTest (int x, int y)
     //       从而满足"模块遮挡浮层时独占鼠标"的需求；
     //   —— 如果确实是空白区且落在挖洞矩形内，再返回 false 让事件冒泡给父组件（Editor）。
     const juce::Point<int> p { x, y };
+
+    // Hide 浮层标题栏区域：无论是否有模块覆盖，一律交给 Editor（浮层在模块之上）
+    if (overlayPassThroughRect.contains (p))
+        return false;
 
     bool insideHole = false;
     for (const auto& h : hitTestHoles)

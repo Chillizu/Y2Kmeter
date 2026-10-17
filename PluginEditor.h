@@ -103,9 +103,11 @@ public:
     ~Y2KmeterAudioProcessorEditor() override;
 
     void paint(juce::Graphics&) override;
+    void paintOverChildren(juce::Graphics&) override;
     void resized() override;
     void visibilityChanged() override;
     void parentHierarchyChanged() override;
+    void childrenChanged() override;
 
     // 鼠标事件：右上角关闭按钮 + 空白区域拖拽窗口（仅 Standalone 模式生效）
     void mouseMove  (const juce::MouseEvent&) override;
@@ -218,6 +220,12 @@ private:
     void enterStickMode();
     void exitStickMode();
     void toggleStickTopBottom();
+
+    // 驻留期间窗口高度被改变（用户拖拽底边）后，延时重新 SETPOS，
+    // 让系统工作区占位与窗口实际高度保持一致；否则会出现空档/压住其他窗口。
+    //   · 只比较物理高度，10Hz 调用开销可忽略；
+    //   · 需等高度稳定 ~200ms 再重排，避免拖拽过程中频繁 SETPOS。
+    void updateStickDockGeometry();
 #endif
 
     // 把顶层窗口调整到目标尺寸（居中于当前屏幕 userArea），处理 resizeLimits
@@ -425,20 +433,22 @@ private:
     juce::Rectangle<int> stickBackupWindowBounds;       // 进入 stick 前的窗口 bounds 备份
     // 进入 stick 前 constrainer 的 resizeLimits（退出时恢复宽度锁定）
     int stickSavedMinW = 0, stickSavedMinH = 0, stickSavedMaxW = 0, stickSavedMaxH = 0;
+    // 驻留态窗口的物理高度（px）：当前已提交给 AppBar 的厚度 / 正在等待稳定的新高度
+    int stickDockedHeightPx  = 0;
+    int stickPendingHeightPx = 0;
+    int stickStableTicks     = 0;
+    // AppBar 最终提交的物理矩形（px）；窗口若被 JUCE/系统挪走，timer 会据此搬回去
+    juce::Rectangle<int> stickDockRectPx;
+    // stick 期间把顶层 constrainer 的"最小可见量"清零：否则任何 setBoundsConstrained /
+    //   边框拖拽都会把窗口夹进 userArea（= 被自己占位压缩后的工作区）→ 窗口被推下去。
+    int  stickSavedOnscreenTop = 0, stickSavedOnscreenLeft = 0,
+         stickSavedOnscreenBottom = 0, stickSavedOnscreenRight = 0;
+    bool stickOnscreenSaved = false;
+    void redockStickAfterGeometryChange();
+    void setStickOnscreenRelaxed (bool relaxed);
 #endif
 
-    // v1.8.3：布局锁定前记住的 resize 上下限，锁定时用当前尺寸夹紧、解锁时还原。
-    //   · 走 setResizeLimits 而非 setResizable —— 后者会 recreateDesktopWindow
-    //     导致窗口"闪现"一次；前者只是改约束器上下限，不重建 peer。
-    //   · initValid=false 表示还没保存过原始值（构造时 initial=true 分支不写）。
-    int  savedLockMinW = 0, savedLockMinH = 0, savedLockMaxW = 0, savedLockMaxH = 0;
-    bool savedLockLimitsValid = false;
-
-    // v1.8.3：Editor 在构造末尾调用 applyLayoutLocked(initial=true) 从 state 恢复锁定态时
-    // Editor 可能还未 attach 到 Y2KMainWindow / 顶层窗口尺寸未就绪；此时无法安全调用
-    // setResizeLimits（ComponentBoundsConstrainer 会 assert(minW>0 && minH>0)）。
-    // 用此标记等 parentHierarchyChanged 触发后补做一次真正的 apply。
-    bool pendingLockApplyOnAttach = false;
+    // v2.8.2：L 只是交互闸门，不再保存/改写 resizeLimits（旧 savedLock* / pendingLockApplyOnAttach 已移除）
     bool initialAlwaysOnTopApplied = false; // 首次 visibilityChanged 时把默认置顶应用到顶层窗口的一次性 flag
 
     // 伪全屏状态（v2.5.8）
@@ -473,40 +483,50 @@ private:
     //   做精确的命中测试，避免把整条 titleTextBounds 都当作可点击热区）
     mutable int cachedTitleTextW = 0;
 
-    // —— chrome（标题栏 + 关闭按钮）可见性（订阅 workspace 的 chrome 状态）——
-    //   chrome 隐藏时 chromeDim=true → 标题栏 + × 以 15% alpha 绘制；
-    //   鼠标悬停到 Editor 上自动恢复不透明。
-    bool chromeDim = false;
+    // =====================================================================
+    // 窗口行为模型（v2.8.2 重构）
+    //   三个概念相互独立、职责单一：
+    //   ① L（layoutLocked）：纯"交互闸门"——禁止拖动/缩放窗口、禁止编辑模块。
+    //      不再改 resizeLimits、不再移动/缩放窗口；切换 L 永远不会让窗口跳动。
+    //   ② Hide（autoHideMode）：标题栏 + 工具栏收起。
+    //      · 进入/退出时窗口一次性收缩/展开 chrome 高度（上半屏顶边固定、下半屏
+    //        底边固定；stick 时固定驻留边），基于"当前"窗口计算，不使用旧快照。
+    //      · 悬停时 chrome 以浮层（overlay）形式盖在内容之上显示，窗口几何
+    //        **完全不变** —— 不会再出现悬停闪现 / 拖动后被拉回原位。
+    //   ③ Stick：AppBar 驻留，仅在几何真正改变（进入/退出/切边/Hide 切换/
+    //      用户拖高度）时重新提交占位，悬停不会触发任何占位变化。
+    // =====================================================================
+    bool chromeDim = false;            // 标题栏不占位（== autoHideMode 的布局表现）
     bool mouseInsideEditor = false;
 
-    // v1.8.6：auto-hide 模式（HIDE 按钮按下后自动固定+置顶，鼠标悬停暂显 chrome）
-    bool autoHideMode = false;
-    bool temporaryChromeShow = false; // 防止临时的 chrome show 解除 lock/pin
-    bool autoHideNeedsExitFirst = false; // Hide 后必须等鼠标离开窗口一次，才允许 hover show
-    bool windowWasForeground = false;     // v1.8.6：timer 轮询追踪顶层窗口是否在前台（焦点保护）
-    int  suppressAutoShowCounter = 0;     // v1.8.6：>0 时抑制 auto-show（timer 递减，覆盖异步事件窗口期）
+    bool autoHideMode   = false;       // Hide 已开启（持久化为 ui.chromeVisible=false）
+    bool chromeRevealed = false;       // Hide 下鼠标悬停 → chrome 浮层显示中
+    bool revealArmed    = false;       // Hide 刚开启时需鼠标先离开窗口一次才允许浮现
+    juce::uint32 revealLastInsideMs = 0;
 
-    // —— Hide 按钮收缩窗口支持 ——
-    //   点击 Hide 时，把顶层窗口高度收缩掉 titleBarHeight + toolbarHeight(=26+36=62) 像素，
-    //   Show 恢复时反向加回。根据窗口当前在屏幕中的位置（上/下）决定：
-    //     · 位于屏幕上半部 → 顶边固定，高度向下收缩（模块感觉贴屏幕顶）
-    //     · 位于屏幕下半部 → 底边固定，顶边下移 shrink 像素（模块感觉贴屏幕底）
-    //
-    //   幂等化策略（修复反复 Hide→Show 后窗口累积漂移 + 首次 Show 变形）：
-    //     Hide 时把"切换前"的顶层窗口 bounds 和 resizeLimits 完整快照下来；
-    //     Show 时直接把窗口 setBounds 回快照 bounds，绝不基于"当前窗口 ± shrink"
-    //     做浮动计算——避免 DocumentWindow inset、DPI 舍入、constrainer 夹紧等
-    //     多种误差的累积。这样 N 次 Hide→Show 循环的窗口 bounds 严格等于初始值。
-    //
-    //   limits 还原策略：Show 把 savedResizeMin/Max 与 savedTopBoundsBeforeHide
-    //     做 jmin/jmax 融合后再写回，防止 horizontal bar 等"尺寸超出默认 limits"
-    //     的预设在 setResizeLimits 一瞬被 constrainer 反向夹成狭长矩形。
-    bool hasSavedBoundsBeforeHide = false;
-    juce::Rectangle<int> savedTopBoundsBeforeHide; // Hide 前顶层窗口完整 bounds
-    int  savedResizeMinW = 0;
-    int  savedResizeMinH = 0;
-    int  savedResizeMaxW = 0;
-    int  savedResizeMaxH = 0;
+    // Hide 期间放宽 Editor 的最小高度（否则窗口收缩 chrome 高度后会被 limits 拉回）
+    bool hideLimitsSaved = false;
+    int  hideSavedMinW = 0, hideSavedMinH = 0, hideSavedMaxW = 0, hideSavedMaxH = 0;
+
+    // Hide 悬停检测：仅在 Hide 期间以 30Hz 轮询鼠标位置（无需任何 MouseListener）
+    struct LambdaTimer : public juce::Timer
+    {
+        std::function<void()> callback;
+        void timerCallback() override { if (callback) callback(); }
+    };
+    LambdaTimer chromeRevealPoller;
+
+    // 标题栏是否可交互：chrome 常驻，或 Hide 下浮层正在显示
+    bool isTitleBarInteractive() const noexcept { return ! chromeDim || chromeRevealed; }
+
+    void setAutoHideMode (bool shouldHide);
+    void setChromeRevealed (bool shouldReveal);
+    void updateChromeReveal();
+    int  getChromeHeightPx() const noexcept;
+    void drawTitleBar (juce::Graphics& g);
+
+    // L 闸门：启用/禁用顶层窗口边框 + Editor 右下角的缩放手柄（不碰 resizeLimits）
+    void applyUserResizeGate();
 
     // —— 无边框窗口拖拽支持（仅在 Standalone 下起作用，VST3 宿主中无害）——
     //   拖拽只允许从标题栏发起（而不是任意空白区）
@@ -555,50 +575,6 @@ private:
     //     （反向声明顺序），而我们在 ~Editor 起始处已显式 detach 一次兜底。
     juce::OpenGLContext openGLContext;
 
-    // v1.8.6：顶层窗口 mouseExit 监听器（auto-hide 场景下鼠标穿过标题栏离开窗口时需要）
-    //   · 当 Editor::mouseExit 因鼠标仅离开了 Editor（进入了标题栏）而无法清零
-    //     autoHideNeedsExitFirst 时，由该监听器在鼠标**完全离开顶层窗口**（含标题栏）后清零。
-    //   · 仅监听顶层组件自身的 mouseExit（不监听子组件），避免误触发。
-    class TopLevelExitWatcher : public juce::MouseListener
-    {
-    public:
-        std::function<void()> onExit;
-        void mouseExit(const juce::MouseEvent&) override { if (onExit) onExit(); }
-        void mouseEnter(const juce::MouseEvent&) override {}
-        void mouseDown(const juce::MouseEvent&) override {}
-        void mouseUp(const juce::MouseEvent&) override {}
-        void mouseDrag(const juce::MouseEvent&) override {}
-        void mouseMove(const juce::MouseEvent&) override {}
-        void mouseDoubleClick(const juce::MouseEvent&) override {}
-        void mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails&) override {}
-        void mouseMagnify(const juce::MouseEvent&, float) override {}
-    };
-    std::unique_ptr<TopLevelExitWatcher> topLevelExitWatcher;
-
-    // v1.9.0：workspace 嵌套子组件鼠标监听器（修复 auto-hide 下模块上的鼠标事件无法触发
-    //   auto-show/hide 的问题）。
-    //   · ModulePanel/VirtuPetModule 是 workspace 的子组件，mouseMove 只发给最深子组件
-    //     不向上传播 → workspace.onMouseMoved 对模块区域无效。
-    //   · 此监听器以 addMouseListener(workspace, true) 注册，第二个参数 true 表示接收
-    //     workspace 所有嵌套子组件的鼠标事件（包括 ModulePanel 和 VirtuPetModule）。
-    //   · onMouseMove/Enter：触发 auto-show；onMouseExit：触发 auto-hide。
-    class AutoHideChildWatcher : public juce::MouseListener
-    {
-    public:
-        std::function<void(const juce::MouseEvent&)> onMouseActivity; // mouseMove / mouseEnter
-        std::function<void(const juce::MouseEvent&)> onMouseLeave;    // mouseExit
-        void mouseMove  (const juce::MouseEvent& e) override { if (onMouseActivity) onMouseActivity(e); }
-        void mouseEnter (const juce::MouseEvent& e) override { if (onMouseActivity) onMouseActivity(e); }
-        void mouseExit  (const juce::MouseEvent& e) override { if (onMouseLeave)   onMouseLeave(e); }
-        void mouseDown      (const juce::MouseEvent&) override {}
-        void mouseUp        (const juce::MouseEvent&) override {}
-        void mouseDrag      (const juce::MouseEvent&) override {}
-        void mouseDoubleClick(const juce::MouseEvent&) override {}
-        void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override {}
-        void mouseMagnify   (const juce::MouseEvent&, float) override {}
-    };
-    std::unique_ptr<AutoHideChildWatcher> autoHideChildWatcher;
-
     // ================================================================
     // 模块浮动窗口（Standalone 模式下的模块弹出/脱离功能）
     //   · FloatingModuleWindow 封装一个独立的 DocumentWindow，
@@ -646,6 +622,10 @@ private:
 
     // 将当前所有浮动窗口的真实屏幕 bounds 同步到 ModuleWorkspace 的持久化状态。
     void syncFloatingWindowStatesToWorkspace();
+
+    // 由 workspace 的脱离态记录重建浮动窗口（启动恢复 / 退出 stick 恢复备份布局）。
+    //   已存在同 moduleId 的浮动窗口会跳过，避免重复实例化。
+    void restoreFloatingWindowsFromWorkspace();
 
     // ================================================================
     // v1.9.x：新手引导（仅 Standalone 模式生效，插件宿主模式忽略）

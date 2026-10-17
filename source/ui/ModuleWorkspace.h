@@ -374,6 +374,23 @@ public:
         return result;
     }
     const std::map<juce::String, FloatingState>& getFloatingModuleStatesRaw() const noexcept { return floatingModuleStates_; }
+
+    // 覆盖式写回脱离态记录（保留浮动模块用）。
+    //   场景：stick 临时布局调用 clearAllModules() 会清空脱离态记录，
+    //   而浮动窗口本身仍在 —— 切换完成后把快照写回，避免浮动模块被"遗忘"
+    //   （否则下一次 saveLayoutTree 不再包含它们）。
+    void restoreFloatingModuleStates (const std::map<juce::String, FloatingState>& states) noexcept
+    {
+        floatingModuleStates_ = states;
+    }
+
+    // 补登记一个脱离态（stick 期间新脱离的模块不在备份布局里，退出时需要补上）
+    void addFloatingState (const juce::String& id, ModuleType type,
+                           juce::Rectangle<int> bounds, juce::Rectangle<int> screenBounds,
+                           juce::ValueTree state)
+    {
+        floatingModuleStates_[id] = { type, bounds, screenBounds, state };
+    }
     void setFloatingModuleStates(const std::map<juce::String, juce::Rectangle<int>>& states) {
         floatingModuleStates_.clear();
         for (const auto& [id, bounds] : states)
@@ -468,6 +485,15 @@ public:
     // v1.8.6：auto-hide 模式下按钮始终显示 "Show"（点击退出 autoHide）
     void setAutoHideActive (bool active) { autoHideActive = active; hideBtn.setButtonText((chromeVisible && !autoHideActive) ? "Hide" : "Show"); }
     bool isAutoHideActive() const noexcept { return autoHideActive; }
+
+    // v2.8.2：Hide 态悬停浮层。
+    //   · revealed=true：底部工具栏以浮层形式盖在模块之上显示（canvas 不变，模块不移动）；
+    //   · revealed=false：工具栏完全隐藏。
+    //   · 只在 chromeVisible=false（Hide 态）下有意义；常驻态忽略。
+    void setToolbarOverlayRevealed (bool revealed);
+    bool isToolbarOverlayRevealed() const noexcept { return toolbarOverlayRevealed; }
+    // 把浮层工具栏重新提到所有模块之上（模块被点击时会 toFront 自己，需要周期性纠正）
+    void raiseToolbarOverlay();
 
     // ======================================================
     // Chrome 切换过渡期（transition）控制
@@ -653,6 +679,8 @@ public:
     //     "模块可以遮挡并屏蔽顶部按钮"的用户需求。
     // ======================================================
     void setHitTestHoles (const juce::Array<juce::Rectangle<int>>& holes);
+    // Hide 浮层标题栏条带：落在该矩形内的鼠标事件无条件交给父组件（Editor）
+    void setOverlayPassThroughRect (juce::Rectangle<int> r) noexcept { overlayPassThroughRect = r; }
     bool hitTest (int x, int y) override;
 
     // ======================================================
@@ -775,6 +803,22 @@ private:
     //   避免与旧 layout XML 无此字段的兼容性问题），而是由 Processor 统一持久化。
     bool             layoutLocked = false;
     bool             autoHideActive = false;  // v1.8.6：auto-hide 模式下按钮始终显示 "Show"
+
+    // v2.8.2：Hide 态悬停浮层（工具栏盖在模块之上，窗口几何不变）
+    bool             toolbarOverlayRevealed = false;
+    juce::Rectangle<int> overlayPassThroughRect;
+    bool isToolbarShown() const noexcept { return ! minimalMode_ && (chromeVisible || toolbarOverlayRevealed); }
+
+    // 浮层工具栏的背景板：绘制凸起面板 + 分隔线，并吞掉落在工具栏条带上的鼠标事件，
+    //   防止点穿到下方模块。只在 Hide 浮层显示时可见。
+    struct ToolbarOverlayBackdrop : public juce::Component
+    {
+        explicit ToolbarOverlayBackdrop (ModuleWorkspace& o) : owner (o) { setInterceptsMouseClicks (true, false); }
+        void paint (juce::Graphics& g) override;
+        ModuleWorkspace& owner;
+    };
+    std::unique_ptr<ToolbarOverlayBackdrop> toolbarBackdrop;
+    void paintToolbarBackground (juce::Graphics& g, juce::Rectangle<int> tb);
 
     // Chrome 切换过渡期标志（由 beginChromeTransition/endChromeTransition 设置）
     //   · true 期间，resized() 末尾的"模块越界 clamp"会被跳过，

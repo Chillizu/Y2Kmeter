@@ -43,35 +43,122 @@ namespace {
         return peer != nullptr ? reinterpret_cast<HWND> (peer->getNativeHandle()) : nullptr;
     }
 
-    void y2kAppBarDock (juce::Component* window, bool bottom) noexcept
+    // 窗口所在显示器的物理工作区（px）。不含本窗口的 AppBar 占位 —— 必须在
+    // ABM_REMOVE 之后调用，否则读到的仍是自己被压小后的工作区。
+    bool y2kGetWindowWorkArea (HWND hwnd, RECT& out) noexcept
+    {
+        if (const HMONITOR mon = MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST))
+        {
+            MONITORINFO mi = {};
+            mi.cbSize = sizeof (mi);
+            if (GetMonitorInfo (mon, &mi) != FALSE)
+            {
+                out = mi.rcWork;
+                return true;
+            }
+        }
+
+        return SystemParametersInfo (SPI_GETWORKAREA, 0, &out, 0) != FALSE;
+    }
+
+    // 窗口当前物理矩形（px）。失败返回空矩形。
+    juce::Rectangle<int> y2kGetWindowRectPx (juce::Component* window) noexcept
+    {
+        RECT r = {};
+        const HWND hwnd = y2kGetWindowHwnd (window);
+        if (hwnd == nullptr || ! GetWindowRect (hwnd, &r))
+            return {};
+
+        return { (int) r.left, (int) r.top, (int) (r.right - r.left), (int) (r.bottom - r.top) };
+    }
+
+    // 窗口当前物理高度（px），失败返回 0。
+    int y2kGetWindowHeightPx (juce::Component* window) noexcept
+    {
+        return y2kGetWindowRectPx (window).getHeight();
+    }
+
+    // 把窗口搬到物理矩形（px）。
+    bool y2kMoveWindowToRectPx (juce::Component* window, juce::Rectangle<int> r) noexcept
     {
         const HWND hwnd = y2kGetWindowHwnd (window);
-        if (hwnd == nullptr) return;
+        if (hwnd == nullptr || r.isEmpty())
+            return false;
 
+        return MoveWindow (hwnd, r.getX(), r.getY(), r.getWidth(), r.getHeight(), TRUE) != FALSE;
+    }
+
+    // 把窗口注册成 AppBar 并驻留到工作区顶/底边。
+    // 关键点：占位矩形必须由「显示器工作区 + 窗口高度」显式构造，不能用窗口当前位置
+    // 直接丢给 ABM_QUERYPOS —— QUERYPOS 只做贴边/避让修正，不会把矩形搬到该边：
+    //   窗口若位于 y=250、高 254，SETPOS 会把 [0..504] 整段算成占位，
+    //   于是屏幕顶部空出一条 ≈ 2 倍窗口高的区域。
+    // outDockedRectPx 非空时写回最终提交的物理矩形（供 timer 做几何自检）。
+    bool y2kAppBarDock (juce::Component* window, bool bottom,
+                        juce::Rectangle<int>* outDockedRectPx = nullptr) noexcept
+    {
+        const HWND hwnd = y2kGetWindowHwnd (window);
+        if (hwnd == nullptr) return false;
+
+        // 1) 先撤销旧注册：让工作区立刻恢复成"不含本窗口"的完整区域，
+        //    这样重新 dock（顶/底切换、高度变化）不会把上一次的占位累加进来。
         APPBARDATA abd = {};
         abd.cbSize = sizeof (abd);
         abd.hWnd   = hwnd;
-
-        // 幂等：先移除旧注册再注册，避免重复 dock 时状态错乱
         SHAppBarMessage (ABM_REMOVE, &abd);
 
+        // 2) 占位厚度 = 窗口当前物理高度（stick 模式只锁宽度，高度随窗口走）
+        const auto winRect = y2kGetWindowRectPx (window);
+        const int thickness = winRect.getHeight();
+        if (thickness <= 0)
+            return false;
+
+        RECT work = {};
+        if (! y2kGetWindowWorkArea (hwnd, work))
+            return false;
+
         if (SHAppBarMessage (ABM_NEW, &abd) == FALSE)
-            return;   // 注册失败（如 hwnd 无效），放弃
+            return false;   // 注册失败（如 hwnd 无效），放弃
 
-        // 设置停靠边 + 期望矩形（窗口当前屏幕矩形）
-        abd.uEdge = bottom ? ABE_BOTTOM : ABE_TOP;
-        GetWindowRect (hwnd, &abd.rc);
+        // 3) 由工作区边 + 厚度构造目标矩形（宽 = 工作区宽，避开任务栏/其他 AppBar）
+        abd.uEdge    = bottom ? ABE_BOTTOM : ABE_TOP;
+        abd.rc.left  = work.left;
+        abd.rc.right = work.right;
 
-        // 查询系统计算的建议位置（abd.rc 会被更新为贴边后的最终矩形）
+        if (bottom)
+        {
+            abd.rc.bottom = work.bottom;
+            abd.rc.top    = abd.rc.bottom - thickness;
+        }
+        else
+        {
+            abd.rc.top    = work.top;
+            abd.rc.bottom = abd.rc.top + thickness;
+        }
+
+        // 4) 让系统做避让修正（任务栏自动隐藏、同边已有其他 AppBar 等）
         SHAppBarMessage (ABM_QUERYPOS, &abd);
 
-        // 提交：系统据此缩小工作区（其他窗口让开这条边）
+        // 5) ★ 按目标边重新写一次厚度：QUERYPOS 只保证贴边，不保证尺寸
+        if (bottom)
+            abd.rc.top = abd.rc.bottom - thickness;
+        else
+            abd.rc.bottom = abd.rc.top + thickness;
+
+        // 6) 提交：系统据此缩小工作区（其他窗口让开这条边）
         SHAppBarMessage (ABM_SETPOS, &abd);
 
-        // 把窗口移动到系统建议的最终矩形（ABE_TOP/BOTTOM 下宽度=工作区宽）
-        MoveWindow (hwnd, abd.rc.left, abd.rc.top,
-                    abd.rc.right  - abd.rc.left,
-                    abd.rc.bottom - abd.rc.top, TRUE);
+        // 7) 把窗口搬到最终矩形（宽度铺满工作区，高度 = 厚度）
+        const juce::Rectangle<int> docked { (int) abd.rc.left, (int) abd.rc.top,
+                                            (int) (abd.rc.right - abd.rc.left),
+                                            (int) (abd.rc.bottom - abd.rc.top) };
+        if (! y2kMoveWindowToRectPx (window, docked))
+            return false;
+
+        if (outDockedRectPx != nullptr)
+            *outDockedRectPx = docked;
+
+        return true;
     }
 
     void y2kAppBarUndock (juce::Component* window) noexcept
@@ -238,6 +325,81 @@ void Y2KmeterAudioProcessorEditor::syncFloatingWindowStatesToWorkspace()
     }
 }
 
+// 由 workspace 的脱离态记录重建浮动窗口。
+//   · 用于"从存档恢复"以及"退出 stick 后还原备份布局"；
+//   · 调用前必须确保 floatingWindows_ 为空（否则会重复实例化）。
+void Y2KmeterAudioProcessorEditor::restoreFloatingWindowsFromWorkspace()
+{
+    if (isPluginHost || workspace == nullptr)
+        return;
+
+    // 先补登记"存活但不在记录里"的浮动窗口（stick 期间新脱离的模块不在备份里），
+    // 否则它们会从下一次 saveLayoutTree 里悄悄消失。
+    for (auto& wnd : floatingWindows_)
+    {
+        if (wnd == nullptr) continue;
+        auto* c = dynamic_cast<ModulePanel*> (wnd->getContentComponent());
+        if (c == nullptr || c->getModuleId().isEmpty()) continue;
+
+        const auto& statesNow = workspace->getFloatingModuleStatesRaw();
+        if (statesNow.find (c->getModuleId()) == statesNow.end())
+            workspace->addFloatingState (c->getModuleId(), c->getModuleType(),
+                                         c->getBounds(), wnd->getScreenBounds(),
+                                         c->saveModuleSpecificState());
+    }
+
+    const auto floatingStates = workspace->getFloatingModuleStatesRaw();
+    if (floatingStates.empty())
+        return;
+
+    // popOutModule 会修改 workspace 内部 map，不能边遍历引用边修改 → 使用上面的副本
+    for (const auto& [id, state] : floatingStates)
+    {
+        // 已经有同 id 的浮动窗口（例如 stick 期间一直保持浮动的模块）→ 跳过，
+        // 否则会重复实例化出第二个窗口。
+        bool alreadyOpen = false;
+        for (auto& wnd : floatingWindows_)
+        {
+            if (wnd == nullptr) continue;
+            if (auto* c = dynamic_cast<ModulePanel*> (wnd->getContentComponent()))
+                if (c->getModuleId() == id) { alreadyOpen = true; break; }
+        }
+        if (alreadyOpen)
+            continue;
+
+        auto panel = createModule (state.type);
+        if (panel == nullptr)
+            continue;
+
+        panel->setModuleId (id);
+        if (state.moduleState.isValid())
+            panel->restoreModuleSpecificState (state.moduleState);
+        panel->setBounds (state.bounds);
+        auto* raw = panel.get();
+
+        // addModule 接管所有权；popOutModule 再把它交给 Editor 创建浮动窗口
+        workspace->addModule (std::move (panel), false);
+        workspace->popOutModule (*raw);
+
+        // popOutModule 会用当前状态重写脱离记录，这里写回备份里的业务状态
+        if (state.moduleState.isValid())
+            workspace->updateFloatingStateModuleState (id, state.moduleState);
+
+        if (! state.screenBounds.isEmpty() && ! floatingWindows_.empty())
+        {
+            auto* wnd = floatingWindows_.back().get();
+            wnd->setLayoutLocked (false);
+            wnd->setBounds (state.screenBounds);
+            wnd->setLayoutLocked (layoutLocked);
+        }
+
+        if (! floatingWindows_.empty())
+            workspace->updateFloatingStateScreenBounds (id, floatingWindows_.back()->getScreenBounds());
+    }
+}
+
+
+
 // ==========================================================
 // FpsFrameListener——嵌套实现（封装在 .cpp 以绕开 AnalyserHub 完整头
 //   在 PluginEditor.h 里暴露时导致的 MSVC include guard 串扰问题）
@@ -289,7 +451,7 @@ public:
         const juce::Font versionFont = PinkXP::getFont (10.0f, juce::Font::italic);
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
         const int nameW    = nameFont.getStringWidth ("Y2Kmeter");
-const int versionW = versionFont.getStringWidth ("v2.8.1");
+const int versionW = versionFont.getStringWidth ("v2.8.5");
         const int urlW     = urlFont.getStringWidth ("iisaacbeats.cn");
         constexpr int gap1 = 6;
         constexpr int gap2 = 10;
@@ -330,7 +492,7 @@ const int versionW = versionFont.getStringWidth ("v2.8.1");
     {
         // ------- 1) 顶部抬头文字：软件名 + 版本号 + 官网（低对比度，贴在底图上）-------
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.8.1";
+const juce::String versionText = "v2.8.5";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont(12.0f, juce::Font::plain);
@@ -1186,59 +1348,8 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
     // ★ Bug2修复：恢复上一次会话中处于脱离态的模块（仅在 Standalone 模式）
     //   必须在 onModulePopOutRequested 设置完毕和 onLayoutPresetChanged 设置之前执行，
     //   因为需要 onModulePopOutRequested 回调来创建 FloatingModuleWindow。
-    if (!isPluginHost && workspace != nullptr)
-    {
-        const auto floatingStates = workspace->getFloatingModuleStatesRaw();
-        if (!floatingStates.empty())
-        {
-            // 恢复脱离态模块：先复制快照，再逐个创建并弹出。
-            // popOutModule 会更新 workspace 内部 floatingModuleStates_，不能边遍历
-            // getFloatingModuleStatesRaw() 返回的原始 map 边修改，否则会造成重复恢复。
-            for (const auto& [id, state] : floatingStates)
-            {
-                // 通过 Editor 自身的 createModule 工厂创建模块
-                auto panel = createModule(state.type);
-                if (panel == nullptr)
-                    continue;
-
-                panel->setModuleId(id);
-                if (state.moduleState.isValid())
-                    panel->restoreModuleSpecificState(state.moduleState);
-                panel->setBounds(state.bounds);
-                auto* raw = panel.get();
-
-                // addModule 接管所有权（加入 modules OwnedArray + hookPanel 绑定回调），
-                // autoPosition=false 配合已设置的 bounds 避免自动排序覆盖原始位置
-                workspace->addModule(std::move(panel), false);
-
-                // popOutModule 从 modules 中取出（不 delete），通知 Editor 创建浮动窗口
-                workspace->popOutModule(*raw);
-
-                // popOutModule 会用当前模块状态重写浮动状态；恢复流程必须重新写回
-                // 存档中的业务状态，防止首次保存时丢失恢复前的 moduleState。
-                if (state.moduleState.isValid())
-                    workspace->updateFloatingStateModuleState(id, state.moduleState);
-
-                // ★ Bug1修复：若存档中存在 screenBounds（即用户脱离后调整过窗口位置/大小），
-                // 则覆盖 popOutModule 自动计算的窗口位置，精确还原至用户离开时的状态
-                if (!state.screenBounds.isEmpty() && !floatingWindows_.empty())
-                {
-                    auto* wnd = floatingWindows_.back().get();
-                    wnd->setLayoutLocked(false);
-                    wnd->setBounds(state.screenBounds);
-                    wnd->setLayoutLocked(layoutLocked);
-                }
-
-                // ★ 无论是否从存档恢复 screenBounds，立即同步到 floatingModuleStates_。
-                // popOutModule 记录的 workspace 坐标在 restore 时已不再准确；
-                // 此调用确保首次 saveLayoutTree 写入的是浮动窗口实际屏幕位置。
-                if (workspace != nullptr && !floatingWindows_.empty())
-                    workspace->updateFloatingStateScreenBounds(
-                        id, floatingWindows_.back()->getScreenBounds());
-
-            }
-        }
-    }
+    //   具体重建逻辑见 restoreFloatingWindowsFromWorkspace()（退出 stick 后也复用它）。
+    restoreFloatingWindowsFromWorkspace();
 
     // 4.b) P4：host 调用 getStateInformation 前，Processor 会触发此钩子，
     //      把 ModuleWorkspace 里 debounce 合并中的变更立即 flush，并
@@ -1292,32 +1403,12 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
             floatingWindows_.clear();
         }
 
-        // 切换布局预设期间抑制 auto-show，避免窗口瞬间跳动到屏幕边缘时
-        // 鼠标被判定为"进入窗口"而触发临时 chrome 展开，挤占模块区域。
-        ++suppressAutoShowCounter;
-
-        // ★ 预设切换前：自动退出 auto-hide 模式 + 解除布局锁定。
-        //   否则 applyLayoutPreset 中的 setSize/setBounds 会被
-        //   applyLayoutLocked 锁定的 resizeLimits(w,h,w,h) 夹回
-        //   当前收缩尺寸，导致预设宽度/高度无法正确应用。
-        if (autoHideMode)
-        {
-            autoHideMode = false;
-            if (workspace != nullptr) workspace->setAutoHideActive (false);
-            hasSavedBoundsBeforeHide = false;
-        }
-
-        if (layoutLocked)
-            applyLayoutLocked (false, /*initial*/ false);
-
-        // 确保 workspace chrome 可见：applyLayoutPreset 通过
-        // getCanvasArea() 反推 overheadH 时依赖 chromeVisible 状态；
-        // chrome 隐藏时 canvas 满铺导致 overheadH 少算 toolbarHeight(36px)，
-        // 最终窗口高度比预期多 36px。
+        // ★ 预设切换前：先退出 Hide（窗口展开回常驻态）。
+        //   applyLayoutPreset 通过 getCanvasArea() 反推 overheadH 时依赖 chromeVisible；
+        //   Hide 态 canvas 满铺会让 overheadH 少算工具栏高度。
+        //   v2.8.2：L 只是交互闸门、不再改 resizeLimits，因此预设切换无需解锁 L。
         if (workspace != nullptr && ! workspace->isChromeVisible())
             workspace->setChromeVisible (true);
-
-        autoHideNeedsExitFirst = false;
 
         // v1.9.x：新手引导期间的预设切换处理
         //   · 切换到非 default 预设 → 跳过引导
@@ -1333,7 +1424,6 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
         }
 
         applyLayoutPreset ((int) preset);
-        --suppressAutoShowCounter;
     };
 
     // 4.05b) 预设 Save/Load —— 仅做透传：workspace 已经弹完 FileChooser，
@@ -1357,383 +1447,21 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
     workspace->onStickToggleClicked = [this]() { toggleStickTopBottom(); };
 #endif
 
-    // 4.1) chrome 可见性变化 → 隐藏/显示顶部 TitleBar
-    //     切换时需要 resized() 重新布局（隐藏后 workspace 应占满整个窗口），
-    //     并整体 repaint 而不仅仅 repaint 标题栏矩形。
-    //     模块 y 坐标不做任何补偿，靠 workspace 自身位置变化带动模块整体平移。
+    // 4.1) chrome 可见性变化（Hide/Show 按钮 / 启动恢复）→ 进入/退出 Hide 模式
+    //     v2.8.2：workspace 的 chromeVisible 只在"用户点 Hide/Show"或"启动恢复"时翻转；
+    //     悬停浮层不经过此回调（浮层不改窗口几何），这里只做一次性的收缩/展开。
+    //     详细状态机见 setAutoHideMode / setChromeRevealed / updateChromeReveal。
     workspace->onChromeVisibleChanged = [this](bool visible)
     {
-        // ★ 整个 chrome 显隐回调期间抑制 auto-show，防止窗口 resize
-        //   （topComp->setBounds）过程中 JUCE 分发虚假 mouseEnter/mouseMove
-        //   事件导致误触发 hover-show。首次启动时此路径不经过
-        //   onLayoutPresetChanged 的保护，需要独立包裹。
-        //   使用计数器而非 bool：setBounds() 会 post 异步 mouse 事件，
-        //   回调返回后 counter>0 仍能拦截 ~300ms（3 个 timer tick）内的异步事件。
-        suppressAutoShowCounter = 3;
-
-        const bool toHide = ! visible;           // 本次切换是"进入隐藏态"吗？
-
-        // 切换态时重置 hover/pressed，避免残留视觉
-        closeButtonHovered = closeButtonPressed = false;
-        pinButtonHovered   = pinButtonPressed   = false;
-        minButtonHovered   = minButtonPressed   = false;
-
-        // ========================================================
-        // v1.8.6：auto-hide 模式 —— HIDE 按钮按下后自动固定+置顶，
-        //   鼠标悬停暂显 chrome，离开恢复隐藏。
-        //   · 进入隐藏：autoHide=true、layoutLocked=true、alwaysOnTop=true
-        //   · 临时显隐（鼠标 hover）：不触动 lock/pin 状态，不缩放窗口
-        //   · 真正 Show（用户点 Show 按钮）：解锁、取消 autoHide，但保留置顶状态
-        //   · 窗口缩放：首次 HIDE / 显式 SHOW / hover 进出 均会执行
-        // ========================================================
-        const bool wasInAutoHide = autoHideMode;
-        bool shouldShrink = false;
-        bool shouldExpand = false;
-        bool isTemporaryResize = false;  // hover 触发 vs 按钮点击触发
-
-        if (toHide)
-        {
-            // 首次 HIDE → 进入 auto-hide 模式（lock + pin 仅设一次）+ 收缩窗口
-            if (! autoHideMode)
-            {
-                autoHideMode = true;
-                if (workspace != nullptr) workspace->setAutoHideActive (true);
-                applyLayoutLocked (true, /*initial*/ false);
-                setAlwaysOnTopActive (true);
-                shouldShrink = true;
-            }
-            else
-            {
-                // Hover-hide（鼠标移出窗口）：重新收缩窗口，保持 autoHide 状态不变
-                shouldShrink = true;
-                isTemporaryResize = true;
-            }
-        }
-        else // showing chrome
-        {
-            if (autoHideMode && ! temporaryChromeShow)
-            {
-                // 用户点 Show 按钮：真正退出 autoHide + 展开窗口
-                autoHideMode = false;
-                if (workspace != nullptr) workspace->setAutoHideActive (false);
-                applyLayoutLocked (false, /*initial*/ false);
-                shouldExpand = true;
-            }
-            else if (autoHideMode)
-            {
-                // Hover-show（鼠标移入窗口）：临时展开窗口，保持 autoHide/lock/pin 不变
-                shouldExpand = true;
-                isTemporaryResize = true;
-            }
-        }
-
-        // ------------------------------------------------------------
-        // Hide 收缩窗口 / Show 反向展开（仅在首次 HIDE / 显式 SHOW 时）
-        //   · Hide：窗口高度 -shrink（上半屏顶边固定、下半屏底边固定），
-        //            workspace 占满整窗后，模块屏幕位置自然贴向对应屏幕边。
-        //   · Show：严格还原 Hide 前的完整 bounds 快照（幂等），不做浮动计算。
-        //
-        // 过渡期保护：ModuleWorkspace::setChromeVisible 会开启
-        //   chromeTransitionActive，使过渡期内的 resized() 跳过模块 clamp，
-        //   避免模块高度在中间帧被错误压缩。
-        //
-        // 启动守卫 isShowing()：Standalone App 恢复持久化状态时会调
-        //   setChromeVisible，此时 Editor 还未上屏，不应改窗口尺寸。
-        // ------------------------------------------------------------
-        constexpr int kToolbarHeight = 36; // 与 ModuleWorkspace::toolbarHeight 保持一致
-        const int shrink = PinkXP::ui(titleBarHeight) + PinkXP::ui(kToolbarHeight); // 随 UI 密度缩放
-
-        auto* topComp = getTopLevelComponent();
-        const bool isStandalone = juce::JUCEApplicationBase::isStandaloneApp()
-                                  && topComp != nullptr && topComp != this;
-        // 只在 Standalone 下真正调整顶层窗口尺寸。插件宿主（VST3/AU 等）由 DAW
-        //   管理窗口，插件擅自 setSize 极易与宿主打架（被宿主拉回、视觉抖动）。
-        //   宿主模式下走"不改窗口"兜底路径，chromeDim 已让 Editor::resized 让出
-        //   titleBarHeight 给 workspace，模块会自然跟随 workspace 上移/下移。
-        const bool canResizeWindow = isShowing() && isStandalone && ! isPluginHost;
-
-        // 判断当前窗口处于屏幕"上半"还是"下半"：
-        //   · Hide 路径用"切换前"的位置（当前就是切换前，因为 setBounds 还没执行）
-        //   · Show 路径用"当前"位置（窗口目前仍处在被 Hide 后的收缩态）。
-        //     由于 Hide 时只改了高度和可能的 y，上/下半判断对 Show 仍然一致。
-        bool bottomAligned = false;
-        if (canResizeWindow && topComp != nullptr)
-        {
-            const auto topScreenBounds = (topComp == this) ? getScreenBounds() : topComp->getScreenBounds();
-            const auto* display = juce::Desktop::getInstance()
-                                     .getDisplays()
-                                     .getDisplayForPoint(topScreenBounds.getCentre());
-            const auto userArea = (display != nullptr) ? display->userArea
-                                                        : juce::Rectangle<int> (1280, 720);
-            const int windowCenterY = topScreenBounds.getCentreY();
-            const int screenCenterY = userArea.getCentreY();
-            bottomAligned = (windowCenterY > screenCenterY);
-        }
-
-        // 拼豆贴画与模块共享 workspace 坐标系，会随 workspace 原点一起平移，
-        //   因此无需在此处单独补偿。
-
-        // 切换 overlay 可见性：仅在 hide 态下显示抬头文字 + 浮动按钮
-        if (chromeHiddenOverlay != nullptr)
-            chromeHiddenOverlay->setVisible (toHide);
-
-        // ------------------------------------------------------------
-        // 实际收缩 / 展开顶层窗口（仅在 canResizeWindow 时执行）
-        //   先 setBounds（会触发 Editor::resized → workspace 重新布局），
-        //   再 repaint，避免闪烁。
-        //
-        //   幂等化关键：Hide 时快照切换前窗口 bounds + resizeLimits，
-        //     Show 时直接 setBounds 回快照值，不做"当前 ± shrink"浮动计算。
-        //     这样可彻底消除累积偏差（DocumentWindow inset、DPI 舍入、
-        //     bottomAligned 翻转、constrainer 夹紧等），N 次 Hide→Show 循环
-        //     后窗口 bounds 严格等于初始值。
-        // ------------------------------------------------------------
-        if (canResizeWindow && (shouldShrink || shouldExpand))
-        {
-            if (shouldShrink)
-            {
-                // 临时收缩（hover-hide）使用首次 HIDE 时保存的快照，不重新取值
-                if (! isTemporaryResize)
-                {
-                    // 1) 快照当前完整 bounds + resizeLimits（将在 Show 时原样还原）
-                    savedTopBoundsBeforeHide = topComp->getBounds();
-                    if (auto* cbc = getConstrainer())
-                    {
-                        savedResizeMinW = cbc->getMinimumWidth();
-                        savedResizeMinH = cbc->getMinimumHeight();
-                        savedResizeMaxW = cbc->getMaximumWidth();
-                        savedResizeMaxH = cbc->getMaximumHeight();
-                    }
-                    hasSavedBoundsBeforeHide = true;
-                }
-
-                // 2) 计算 Hide 后的目标 bounds（基于完整快照）
-                //    · 上半屏：顶边固定，高度 -shrink（底边上移 shrink）
-                //    · 下半屏：底边固定，顶边 +shrink（高度 -shrink）
-                const auto b = savedTopBoundsBeforeHide;
-                const int newY = bottomAligned ? (b.getY() + shrink) : b.getY();
-                const int newH = juce::jmax (1, b.getHeight() - shrink);
-
-                // 3) 放宽 resizeLimits 以让 newH 能被接受（不让 min 夹回）
-                //   · Editor 自身的 constrainer
-                if (getConstrainer() != nullptr)
-                {
-                    setResizeLimits (juce::jmin (savedResizeMinW, b.getWidth()),
-                                     juce::jmin (savedResizeMinH, newH),
-                                     juce::jmax (savedResizeMaxW, b.getWidth()),
-                                     juce::jmax (savedResizeMaxH, b.getHeight()));
-                }
-                //   · 顶层 ResizableWindow 的 constrainer（applyLayoutLocked 锁在此处）
-                if (auto* rw = dynamic_cast<juce::ResizableWindow*> (topComp))
-                {
-                    rw->setResizeLimits (juce::jmin (savedResizeMinW, b.getWidth()),
-                                         juce::jmin (savedResizeMinH, newH),
-                                         juce::jmax (savedResizeMaxW, b.getWidth()),
-                                         juce::jmax (savedResizeMaxH, b.getHeight()));
-                }
-
-                // 4) 应用收缩后的窗口 bounds
-                topComp->setBounds (b.getX(), newY, b.getWidth(), newH);
-            }
-            else
-            {
-                // Show 路径：严格还原到 Hide 前的快照，绝不基于当前窗口做浮动计算
-                if (hasSavedBoundsBeforeHide)
-                {
-                    // 1) 先放宽 resizeLimits 让快照 bounds 能被接受
-                    if (getConstrainer() != nullptr)
-                    {
-                        setResizeLimits (juce::jmin (savedResizeMinW, savedTopBoundsBeforeHide.getWidth()),
-                                         juce::jmin (savedResizeMinH, savedTopBoundsBeforeHide.getHeight()),
-                                         juce::jmax (savedResizeMaxW, savedTopBoundsBeforeHide.getWidth()),
-                                         juce::jmax (savedResizeMaxH, savedTopBoundsBeforeHide.getHeight()));
-                    }
-
-                    // v1.9.0: 若处于布局锁定态，shrink 路径的 applyLayoutLocked 会把
-                    //   顶层 ResizableWindow 的 limits 锁死在收缩后的尺寸上。此处
-                    //   必须在 setBounds 扩展窗口前同样放松 RW 层的 limits，否则
-                    //   native 窗口受 OS 级 constrainer 约束无法扩回原尺寸，
-                    //   导致模块渲染区域被压缩。扩展完成后再由后续的
-                    //   applyLayoutLocked(true) 重新锁到当前（扩展后）尺寸。
-                    if (layoutLocked)
-                    {
-                        if (auto* rw = dynamic_cast<juce::ResizableWindow*> (topComp))
-                        {
-                            rw->setResizeLimits (
-                                juce::jmin (savedResizeMinW, savedTopBoundsBeforeHide.getWidth()),
-                                juce::jmin (savedResizeMinH, savedTopBoundsBeforeHide.getHeight()),
-                                juce::jmax (savedResizeMaxW, savedTopBoundsBeforeHide.getWidth()),
-                                juce::jmax (savedResizeMaxH, savedTopBoundsBeforeHide.getHeight()));
-                        }
-                    }
-
-                    // 2) 直接还原完整 bounds（x/y/w/h 全部等于 Hide 前快照）
-                    topComp->setBounds (savedTopBoundsBeforeHide);
-
-                    // 3) 还原 resizeLimits（永久展开时）；临时展开不还原，保持宽松
-                    //    以便下次 hover-hide 能顺利收缩。
-                    if (! isTemporaryResize)
-                    {
-                        //    场景：快照的 savedResizeMin/Max 是"Hide 按下那一刻"的
-                        //      值——而 resizeLimits 未持久化，启动后仅恢复模块 XML
-                        //      不会重跑 preset 扩展 limits；一旦 savedTopBoundsBeforeHide
-                        //      来自 horizontal bar 预设（2558×246 这种超出默认 limits
-                        //      的尺寸），直接写回默认 limits（1600×1100）会把它夹
-                        //      成1600×420。
-                        //    解决：min 向下夹到当前宽高、max 向上抬到当前宽高，其
-                        //      余保持快照值。对 default/tiled 等天然在默认 limits 内的
-                        //      预设无影响；对 horizontal bar 则把上限抬到 screenW。
-                        const auto restoredBounds = savedTopBoundsBeforeHide;
-                        setResizeLimits (juce::jmin (savedResizeMinW, restoredBounds.getWidth()),
-                                         juce::jmin (savedResizeMinH, restoredBounds.getHeight()),
-                                         juce::jmax (savedResizeMaxW, restoredBounds.getWidth()),
-                                         juce::jmax (savedResizeMaxH, restoredBounds.getHeight()));
-
-                        hasSavedBoundsBeforeHide = false;
-                    }
-                }
-                else
-                {
-                    // 防御性路径（当前启动流程下不可达）：
-                    //   Standalone App 在启动时会先 setBounds(show 态)
-                    //   → setChromeVisible(false) 走标准 Hide 路径 → 写入
-                    //   hasSavedBoundsBeforeHide。因此用户首次点 Show 必走主路径。
-                    //   保留此分支是为了防御未来启动流程重构后出现"无快照
-                    //   但需要 Show"的退化情形，避免被 constrainer 夹成狭长矩形。
-                    auto b = topComp->getBounds();
-                    const int newY = bottomAligned ? (b.getY() - shrink) : b.getY();
-                    const int newH = b.getHeight() + shrink;
-
-                    if (auto* cbc = getConstrainer())
-                    {
-                        setResizeLimits (juce::jmin (cbc->getMinimumWidth(),  b.getWidth()),
-                                         juce::jmin (cbc->getMinimumHeight(), newH),
-                                         juce::jmax (cbc->getMaximumWidth(),  b.getWidth()),
-                                         juce::jmax (cbc->getMaximumHeight(), newH));
-                    }
-
-                    topComp->setBounds (b.getX(), newY, b.getWidth(), newH);
-                }
-            }
-        }
-
-        // ★ v1.8.6 修复：chromeDim 必须在窗口 resize 完成后才设置，避免
-        //   chromeDim=true 但窗口未实际缩小导致的 workspace 越界空余。
-        chromeDim = toHide;
-
-        // 任何 chrome 显隐切换都需要让 Editor 根据 chromeDim 重新分配内部区域：
-        //   · chrome 显示 → workspace 从顶部让出 titleBarHeight
-        //   · chrome 隐藏 → workspace 占满整窗
-        // 窗口缩放路径中 topComp->setBounds 已触发一次，这里再调一次确保最终态正确。
-        resized();
-        repaint();
-
-        // v1.9.0 修复：shrink/expand 代码块会放宽顶层 ResizableWindow 的
-        //   resize limits（rw->setResizeLimits）以让窗口成功缩小/放大。
-        //   但若当前处于布局锁定态（L 按钮按下），放宽后的 limits 会绕过锁定，
-        //   导致用户即使锁定状态下也能拉动窗口边缘调整大小。
-        //   此处在 resize 完成后重新调用 applyLayoutLocked(true)，
-        //   将 limits 重新夹紧到当前窗口尺寸，恢复 lock 对 resize 的约束。
-        //   注意：只有当 layoutLocked=true 且确实发生了 shrink/expand 时才需要；
-        //   permanent show（退出 auto-hide）路径中 layoutLocked 已被设为 false。
-        if (layoutLocked && canResizeWindow && (shouldShrink || shouldExpand))
-            applyLayoutLocked (true, /*initial*/ false);
-
-        // auto-hide 守卫：shouldShrink 后在窗口 resize 完成后设置标志，因此
-        //   resize 引发的虚假 mouseEnter 不会触发。mouseExit 无条件清除，
-        //   用户下次 mouseEnter 即可正常触发 hover show。
-        //  shouldExpand（用户点 Show）时清除标志，恢复正常。
-        if (shouldShrink)
-        {
-            autoHideNeedsExitFirst = true;
-
-            // 上半屏 shrink 后底边上移，鼠标可能已经落在窗口外。
-            // 此时"先离开一次"的条件天然满足，应直接清零 guard，
-            // 否则首次移入会被拦截，用户需要移出再移入两次才能触发 auto-show。
-            if (auto* top = getTopLevelComponent())
-            {
-                const auto topScreenBounds = (top == this) ? getScreenBounds() : top->getScreenBounds();
-                const auto mouseScreen = juce::Desktop::getInstance().getMainMouseSource().getScreenPosition().toInt();
-                if (! topScreenBounds.contains (mouseScreen))
-                    autoHideNeedsExitFirst = false;
-            }
-        }
-        else if (shouldExpand)
-        {
-            autoHideNeedsExitFirst = false;
-        }
-
-        // 切换后同步 workspace 的 hit-test 挖洞：让 overlay 按钮/文字区的鼠标事件
-        //   冒泡到 Editor，从而 Editor 能直接接管浮动按钮的 hover/press 逻辑，
-        //   同时任何压在按钮之上的模块都能正常独占鼠标事件（JUCE 先派发给子组件）。
-        updateWorkspaceHitTestHoles();
-
-        // suppressAutoShowCounter 由 timerCallback 递减，此处不清零（异步事件窗口保护）
+        setAutoHideMode (! visible);
     };
 
-    // 4.1b) 鼠标进入 workspace → auto-hide 模式下暂显 chrome
-    //   · workspace 覆盖整个 Editor 时 Editor::mouseEnter 可能不触发，
-    //     workspace 自身的 mouseEnter 回调更可靠。
-    workspace->onMouseEntered = [this]()
-    {
-        // 布局预设切换期间抑制 auto-show（见 onLayoutPresetChanged）
-        if (suppressAutoShowCounter > 0)
-            return;
-
-        // Hide 后必须等鼠标先离开窗口一次，才允许鼠标再次进入时触发 hover show
-        if (autoHideNeedsExitFirst)
-            return;
-
-        if (autoHideMode && workspace != nullptr && ! workspace->isChromeVisible())
-        {
-            temporaryChromeShow = true;
-            workspace->setChromeVisible (true);
-            temporaryChromeShow = false;
-        }
-    };
-
-    // 4.1c) 鼠标在 workspace 内移动 → auto-hide 模式下暂显 chrome
-    //   · mouseMove 比 mouseEnter 更可靠：resize 后 JUCE 内部
-    //     isMouseOverOrDragging 状态可能导致 mouseEnter 被跳过，
-    //     但 mouseMove 每次鼠标移动都会触发，不依赖 enter/exit 状态。
-    //   · setChromeVisible 内部有 idempotent guard，重复调用是安全的。
-    workspace->onMouseMoved = [this]()
-    {
-        // 布局预设切换期间抑制 auto-show（见 onLayoutPresetChanged）
-        if (suppressAutoShowCounter > 0)
-            return;
-
-        if (autoHideNeedsExitFirst)
-            return;
-
-        if (autoHideMode && workspace != nullptr && ! workspace->isChromeVisible())
-        {
-            temporaryChromeShow = true;
-            workspace->setChromeVisible (true);
-            temporaryChromeShow = false;
-        }
-    };
-
-    // 4.1d) 鼠标离开 workspace → auto-hide 模式下检测是否真正离开了顶层窗口
-    //   · 仅判断是否在顶层窗口 bounds 外（不在任何 Editor/workspace 子区域）。
-    //   · hide 态 workspace 占满整窗时 Editor::mouseExit 不触发，靠此路径。
-    //   · 无论 chrome 当前是否可见，只要鼠标真的离开了窗口就必须清零
-    //     autoHideNeedsExitFirst，否则后续 mouseEnter 永远被拦截。
-    workspace->onMouseExited = [this](juce::Point<int> mouseScreenPos)
-    {
-        if (! autoHideMode || workspace == nullptr) return;
-
-        auto* top = getTopLevelComponent();
-        if (top == nullptr) return;
-
-        const auto topScreenBounds = (top == this) ? getScreenBounds() : top->getScreenBounds();
-        if (! topScreenBounds.contains (mouseScreenPos))
-        {
-            if (workspace->isChromeVisible())
-                workspace->setChromeVisible (false);
-            autoHideNeedsExitFirst = false;
-        }
-    };
+    // v2.8.2：旧版 workspace 悬停回调（onMouseEntered/Moved/Exited）不再使用 ——
+    //   Hide 悬停改为 30Hz 轮询鼠标是否位于顶层窗口内（updateChromeReveal），
+    //   不依赖任何 enter/exit 事件，也就不会因窗口 resize 产生的虚假事件而抖动。
+    workspace->onMouseEntered = nullptr;
+    workspace->onMouseMoved   = nullptr;
+    workspace->onMouseExited  = nullptr;
 
     // 4.2) 音频源下拉变化 → 透传给外部（Standalone App 订阅后会真正切换音频设备）
     workspace->onAudioSourceChanged = [this](const juce::String& sourceId, bool isLoopback)
@@ -2511,6 +2239,13 @@ void Y2KmeterAudioProcessorEditor::applyLayoutPreset (int presetId)
                 virtuPetStates.add ({ t->getRoleName(), t->getHunger(), t->getHealth() });
     }
 
+    // stick 临时布局（Horizontal Bar）：浮动模块继续保持浮动，不参与本次重建。
+    //   clearAllModules 会清空脱离态记录 → 先快照，重建完再写回，否则浮动模块会
+    //   从 layout 树里消失（下一次保存就不再包含它们）。
+    std::map<juce::String, ModuleWorkspace::FloatingState> preservedFloatingStates;
+    if (stickActive)
+        preservedFloatingStates = workspace->getFloatingModuleStatesRaw();
+
     // 先清空现有模块 / 拼豆贴画（clearAllModules 不触发 onLayoutChanged）
     workspace->clearAllModules();
 
@@ -3050,6 +2785,10 @@ void Y2KmeterAudioProcessorEditor::applyLayoutPreset (int presetId)
         workspace->addModule (std::move (virtuPet), false);
     }
 
+    // stick：把浮动模块的脱离态记录写回（浮动窗口仍在，不能让它们从布局里消失）
+    if (stickActive && ! preservedFloatingStates.empty())
+        workspace->restoreFloatingModuleStates (preservedFloatingStates);
+
     // 手动回写布局到 Processor（clearAllModules + 批量 addModule 会触发多次
     // onLayoutChanged，我们在这里统一再写一次确保最终态被持久化）
     processor.setSavedLayoutXml (workspace->saveLayoutAsXml());
@@ -3522,7 +3261,21 @@ void Y2KmeterAudioProcessorEditor::paint(juce::Graphics& g)
     //    · 插件宿主模式（VST3 等）：也画"精简抬头"——只绘制背景 + Logo +
     //      "Y2Kmeter v1.1 iisaacbeats.cn"文字；不画右侧最小化/固定/关闭按钮
     //      （宿主窗口已经提供系统级边框/关闭按钮，伪按钮会产生两套 UI 打架）。
+    //    · Hide 态：标题栏不占位；悬停浮层时由 paintOverChildren 画在模块之上。
     if (! chromeDim)
+        drawTitleBar (g);
+    // chrome 隐藏态（未悬停）的浮动关闭按钮 + 抬头文字由 ChromeHiddenOverlay 处理
+}
+
+void Y2KmeterAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
+{
+    // v2.8.2：Hide 悬停浮层 —— 标题栏盖在所有子组件（模块）之上，窗口几何不变
+    if (chromeDim && chromeRevealed)
+        drawTitleBar (g);
+}
+
+void Y2KmeterAudioProcessorEditor::drawTitleBar (juce::Graphics& g)
+{
     {
         auto tb = getTitleBarBounds();
 
@@ -3537,7 +3290,7 @@ void Y2KmeterAudioProcessorEditor::paint(juce::Graphics& g)
 
         // 主标题 "Y2Kmeter"
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.8.1";
+const juce::String versionText = "v2.8.5";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont (12.0f, juce::Font::bold);
@@ -3545,7 +3298,7 @@ const juce::String versionText = "v2.8.1";
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
 
         const int nameW    = nameFont.getStringWidth (nameText);
-        const int versionW = versionFont.getStringWidth ("v2.8.1");
+        const int versionW = versionFont.getStringWidth ("v2.8.5");
         const int urlW     = urlFont.getStringWidth (urlText);
 
         constexpr int gap1 = 6;   // name ↔ version 之间
@@ -3645,8 +3398,6 @@ const juce::String versionText = "v2.8.1";
                           "x", 12.0f, -1, -1);
         }
     }
-    // chrome 隐藏态的浮动关闭按钮 + 抬头文字已交由 ChromeHiddenOverlay 处理
-    //   （作为独立 child 组件，z-order 高于 workspace，避免被覆盖导致无法交互）
 }
 
 // ----------------------------------------------------------
@@ -3688,6 +3439,11 @@ void Y2KmeterAudioProcessorEditor::resized()
 
     // 同步 workspace 的 hit-test 挖洞（按钮位置依赖 getWidth()，resize 后必须重新计算）
     updateWorkspaceHitTestHoles();
+
+    // Hide 悬停浮层：标题栏条带随窗口宽度变化，穿透矩形同步刷新
+    if (chromeRevealed && workspace != nullptr)
+        workspace->setOverlayPassThroughRect (getTitleBarBounds().withTrimmedBottom (-1)
+                                              - workspace->getPosition());
 
     // 插件模式下实时把 Editor 尺寸写回 Processor：host 调用 getStateInformation
     //   时会把最新尺寸一起序列化，下一次重新打开编辑器窗口时即可恢复。
@@ -3756,19 +3512,6 @@ void Y2KmeterAudioProcessorEditor::parentHierarchyChanged()
     }
    #endif
 
-    // v1.8.6：如果顶层窗口监听器已注册但 Editor 正在被从窗口树中移除，
-    //   释放监听器（顶层窗口即将销毁，继续持有原始指针不安全）。
-    if (topLevelExitWatcher != nullptr && getParentComponent() == nullptr)
-        topLevelExitWatcher.reset();
-
-    // v1.9.0：同理，Editor 从窗口树移除时释放 workspace 嵌套子组件监听器。
-    if (autoHideChildWatcher != nullptr && getParentComponent() == nullptr)
-    {
-        if (workspace != nullptr)
-            workspace->removeMouseListener (autoHideChildWatcher.get());
-        autoHideChildWatcher.reset();
-    }
-
     juce::AudioProcessorEditor::parentHierarchyChanged();
 }
 
@@ -3801,98 +3544,9 @@ void Y2KmeterAudioProcessorEditor::visibilityChanged()
         }
     }
 
-    // v1.8.3：布局锁定态延迟 apply。
-    //   构造期 applyLayoutLocked(initial=true, locked=true) 因顶层未挂载 / 尺寸=0
-    //   走了早退分支，仅把 layoutLocked=true 和 pendingLockApplyOnAttach=true 记下。
-    //   visibilityChanged 是顶层可用且尺寸稳定的最早时机——若确实需要补做且当前
-    //   仍是锁定态，则再走一次 initial=true（此时顶层已 ready 会真正跑 constrainer 分支，
-    //   同时 initial=true 保证不回写 Processor 造成 dirty state）。
-    //   触发前先清 pending 避免任何潜在重入。
-    if (pendingLockApplyOnAttach && layoutLocked)
-    {
-        if (auto* top = getTopLevelComponent())
-        {
-            if (top != this && top->getWidth() > 0 && top->getHeight() > 0)
-            {
-                pendingLockApplyOnAttach = false;
-                applyLayoutLocked (true, /*initial*/ true);
-            }
-        }
-    }
-    else if (pendingLockApplyOnAttach && ! layoutLocked)
-    {
-        // 未锁但仍残留 pending：清掉，防止后续每次 hide/show 都重复检查
-        pendingLockApplyOnAttach = false;
-    }
-
-    // v1.8.6：注册顶层窗口 mouseExit 监听器（仅一次），用于处理 auto-hide 下
-    //   鼠标穿过标题栏离开窗口的场景——此时 Editor::mouseExit 已提前触发且
-    //   因鼠标在标题栏内判定"未离开顶层窗口"而不清零 autoHideNeedsExitFirst，
-    //   需要监听顶层窗口自身的 mouseExit 来补清零。
-    if (topLevelExitWatcher == nullptr)
-    {
-        auto* top = getTopLevelComponent();
-        if (top != nullptr && top != this)
-        {
-            topLevelExitWatcher = std::make_unique<TopLevelExitWatcher>();
-            topLevelExitWatcher->onExit = [this]()
-            {
-                // 无论鼠标是从 workspace 直接离开还是穿过标题栏离开，
-                // 只要离开了整个顶层窗口（含标题栏），就必须：
-                //   · 若当前 chrome 因 hover-show 可见 → 隐藏 chrome
-                //   · 清零 autoHideNeedsExitFirst 守卫（否则后续 hover show 永远被拦截）
-                if (! autoHideMode) return;
-
-                if (workspace != nullptr && workspace->isChromeVisible())
-                    workspace->setChromeVisible (false);
-
-                autoHideNeedsExitFirst = false;
-            };
-            top->addMouseListener (topLevelExitWatcher.get(), false);
-        }
-    }
-
-    // v1.9.0：注册 workspace 嵌套子组件鼠标监听器（修复 auto-hide 下模块上鼠标事件无法
-    //   触发 auto-show/hide 的问题）。addMouseListener 第二个参数 true 表示接收 workspace
-    //   所有嵌套子组件（ModulePanel/VirtuPetModule 等）的鼠标事件。
-    if (autoHideChildWatcher == nullptr && workspace != nullptr)
-    {
-        autoHideChildWatcher = std::make_unique<AutoHideChildWatcher>();
-
-        // mouseMove / mouseEnter：auto-hide 模式下鼠标在任何子组件上移动时触发 auto-show。
-        //   复用 suppressAutoShowCounter 和 autoHideNeedsExitFirst 守卫。
-        autoHideChildWatcher->onMouseActivity = [this](const juce::MouseEvent& e)
-        {
-            (void) e;
-            if (suppressAutoShowCounter > 0) return;
-            if (autoHideNeedsExitFirst) return;
-            if (autoHideMode && workspace != nullptr && ! workspace->isChromeVisible())
-            {
-                temporaryChromeShow = true;
-                workspace->setChromeVisible (true);
-                temporaryChromeShow = false;
-            }
-        };
-
-        // mouseExit：鼠标从任何子组件（含模块）离开 workspace 时，检查是否真正
-        //   离开了顶层窗口。若是，则触发 auto-hide 并清零守卫。
-        autoHideChildWatcher->onMouseLeave = [this](const juce::MouseEvent& e)
-        {
-            if (! autoHideMode || workspace == nullptr) return;
-            auto* top = getTopLevelComponent();
-            if (top == nullptr) return;
-            const auto mouseScreen = e.getScreenPosition().toInt();
-            const auto topScreenBounds = (top == this) ? getScreenBounds() : top->getScreenBounds();
-            if (! topScreenBounds.contains (mouseScreen))
-            {
-                if (workspace->isChromeVisible())
-                    workspace->setChromeVisible (false);
-                autoHideNeedsExitFirst = false;
-            }
-        };
-
-        workspace->addMouseListener (autoHideChildWatcher.get(), true);
-    }
+    // v1.8.3 → v2.8.2：L 闸门不再依赖顶层窗口 constrainer，因此不需要"上屏后补做"，
+    //   只需在顶层窗口就绪后同步一次缩放手柄的可交互状态即可（幂等）。
+    applyUserResizeGate();
 }
 
 // ==========================================================
@@ -3925,6 +3579,9 @@ juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getCloseButtonBounds() const
 
 juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getPinButtonBounds() const
 {
+    // stick 驻留态：置顶按钮隐藏，不占位（否则会与 L/× 之间留出一段空隙）
+    if (stickActive) return {};
+
     // 关闭按钮左侧（中间那一个）：固定（置顶）按钮
     auto cb = getCloseButtonBounds();
     const int s = PinkXP::ui(closeButtonSize);
@@ -3934,6 +3591,9 @@ juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getPinButtonBounds() const
 
 juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getMinimiseButtonBounds() const
 {
+    // stick 驻留态：最小化按钮隐藏，不占位
+    if (stickActive) return {};
+
     // Pin 按钮左侧（中间那一个）：最小化按钮
     auto pb = getPinButtonBounds();
     const int s = PinkXP::ui(closeButtonSize);
@@ -3944,10 +3604,12 @@ juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getMinimiseButtonBounds() con
 // 最小化按钮左侧（最左那一个）：布局锁定按钮（v1.8.3 新增）
 juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getLockButtonBounds() const
 {
-    auto mb = getMinimiseButtonBounds();
+    // 依次向左排：× ← 固定 ← 最小化 ← L
+    //   stick 模式下固定/最小化不占位，L 直接紧邻 ×（排版随隐藏自动收拢）。
+    const auto prev = stickActive ? getCloseButtonBounds() : getMinimiseButtonBounds();
     const int s = PinkXP::ui(closeButtonSize);
     const int gap = PinkXP::ui(titleButtonGap);
-    return { mb.getX() - gap - s, mb.getY(), s, s };
+    return { prev.getX() - gap - s, prev.getY(), s, s };
 }
 
 juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getFloatingCloseButtonBounds() const
@@ -4073,13 +3735,76 @@ void Y2KmeterAudioProcessorEditor::handleMinimiseClicked()
 //   退出：取消 AppBar → 恢复备份布局 + 窗口 bounds → 恢复按钮
 //   T/B：顶端（horizontalFull）/ 底端（horizontalBottom）切换
 // ==========================================================
+// stick 期间把顶层窗口 constrainer 的"最小可见量"清零。
+//   ResizableWindow 默认 setMinimumOnscreenAmounts(0x10000, 16, 24, 16)：顶边必须完整落在
+//   显示器 userArea 内。stick 后 userArea 已被自己的占位压缩，JUCE 在 WM_WINDOWPOSCHANGING /
+//   setBoundsConstrained 里会把窗口推到 y=占位厚度（= 旧版"向下闪一下"的根因）。
+void Y2KmeterAudioProcessorEditor::setStickOnscreenRelaxed (bool relaxed)
+{
+    auto* rw = dynamic_cast<juce::ResizableWindow*> (getTopLevelComponent());
+    if (rw == nullptr || rw == static_cast<juce::Component*> (this)) return;
+
+    auto* c = rw->getConstrainer();
+    if (c == nullptr) return;
+
+    if (relaxed)
+    {
+        if (! stickOnscreenSaved)
+        {
+            stickSavedOnscreenTop    = c->getMinimumWhenOffTheTop();
+            stickSavedOnscreenLeft   = c->getMinimumWhenOffTheLeft();
+            stickSavedOnscreenBottom = c->getMinimumWhenOffTheBottom();
+            stickSavedOnscreenRight  = c->getMinimumWhenOffTheRight();
+            stickOnscreenSaved = true;
+        }
+        c->setMinimumOnscreenAmounts (0, 0, 0, 0);
+    }
+    else if (stickOnscreenSaved)
+    {
+        c->setMinimumOnscreenAmounts (stickSavedOnscreenTop, stickSavedOnscreenLeft,
+                                      stickSavedOnscreenBottom, stickSavedOnscreenRight);
+        stickOnscreenSaved = false;
+    }
+}
+
+void Y2KmeterAudioProcessorEditor::redockStickAfterGeometryChange()
+{
+    if (! stickActive) return;
+
+    auto* top = getTopLevelComponent();
+    if (y2kAppBarDock (top, stickBottomAligned, &stickDockRectPx))
+    {
+        stickDockedHeightPx  = y2kGetWindowHeightPx (top);
+        stickPendingHeightPx = stickDockedHeightPx;
+        stickStableTicks     = 0;
+    }
+}
+
 void Y2KmeterAudioProcessorEditor::enterStickMode()
 {
     if (stickActive || workspace == nullptr) return;
 
+    // Hide 态下进入：先展开 → 进入 stick → 再收起。
+    //   保证备份的窗口 bounds / resizeLimits 都是 Show 态的值，Hide 的 limits 快照
+    //   始终嵌套在 stick 之内，退出时不会互相污染。
+    if (! workspace->isChromeVisible())
+    {
+        workspace->setChromeVisible (true);
+        enterStickMode();
+        if (stickActive)
+        {
+            workspace->setChromeVisible (false);
+            revealArmed = true;   // 用户正在浮层上操作：保持浮现
+        }
+        return;
+    }
+
     auto* top = getTopLevelComponent();
+    setStickOnscreenRelaxed (true);
 
     // 1) 备份当前布局 + 窗口 bounds + resizeLimits
+    //    先把浮动窗口的最新屏幕位置/业务状态同步进 workspace，备份才是最新态。
+    syncFloatingWindowStatesToWorkspace();
     stickBackupLayout = workspace->saveLayoutTree();
     if (top != nullptr)
         stickBackupWindowBounds = top->getScreenBounds();
@@ -4091,30 +3816,38 @@ void Y2KmeterAudioProcessorEditor::enterStickMode()
         stickSavedMaxH = cbc->getMaximumHeight();
     }
 
-    // 1.5) 把所有浮动模块 dock 回工作区（与 onLayoutPresetChanged 的 floating
-    //      处理一致）。否则 clearAllModules 清不到浮动窗口里的模块，
-    //      seedDefaultModules 之后用户又能添加第二个（如 milkdrop）。
-    for (auto& wnd : floatingWindows_)
-    {
-        if (wnd != nullptr)
-        {
-            if (auto* content = dynamic_cast<ModulePanel*>(wnd->getContentComponent()))
-            {
-                const auto savedBounds = wnd->getSavedBounds();
-                wnd->setContentNonOwned(content, false);
-                workspace->dockModule(*content, savedBounds);
-            }
-            wnd.reset();
-        }
-    }
-    floatingWindows_.clear();
+    // 1.5) 浮动模块保持原样（不 dock 回来）：
+    //      stick 只是临时条状布局，用户脱离出去的模块应当继续以浮动窗口存在。
+    //      applyLayoutPreset 会在重建前后快照/写回脱离态记录，因此它们不会
+    //      被 clearAllModules 从布局树里抹掉；退出 stick 时再按备份布局恢复。
 
     // 2) 标记激活 + 切换 Horizontal Bar(T)（贴顶横条）
     stickActive        = true;
     stickBottomAligned = false;
     applyLayoutPreset ((int) ModuleWorkspace::LayoutPreset::horizontalFull);
 
-    // 2.5) 锁宽度：stick 模式只允许调高度，宽度锁死到当前（屏幕工作区）宽。
+    // 2.5) AppBar 驻留（缩小工作区，其他窗口让开这条边）。
+    //      先 dock 再锁宽度：dock 会按「工作区宽 × 窗口高」把窗口搬到贴边矩形，
+    //      用搬完后的实际宽度做宽度锁定才准确。
+    if (! y2kAppBarDock (getTopLevelComponent(), stickBottomAligned, &stickDockRectPx))
+    {
+        // 注册失败（极端环境）——回退到普通横向条，不进入驻留态，
+        // 避免工具栏显示 stick 按钮"按下了"但实际没有占位。
+        const auto floatingStatesForRollback = workspace->getFloatingModuleStatesRaw();
+        stickActive = false;
+        setStickOnscreenRelaxed (false);
+        applyLayoutPreset ((int) ModuleWorkspace::LayoutPreset::horizontalFull);
+        // 回退时 stickActive 已为 false，preset 不会自动恢复脱离态记录 → 手动写回
+        workspace->restoreFloatingModuleStates (floatingStatesForRollback);
+        repaint();
+        return;
+    }
+
+    stickDockedHeightPx  = y2kGetWindowHeightPx (getTopLevelComponent());
+    stickPendingHeightPx = stickDockedHeightPx;
+    stickStableTicks     = 0;
+
+    // 2.6) 锁宽度：stick 模式只允许调高度，宽度锁死到当前（屏幕工作区）宽。
     //      applyLayoutPreset 已放宽了高度范围，这里只把宽度 min/max 夹到当前宽。
     if (auto* cbc = getConstrainer())
     {
@@ -4122,10 +3855,7 @@ void Y2KmeterAudioProcessorEditor::enterStickMode()
         setResizeLimits (w, cbc->getMinimumHeight(), w, cbc->getMaximumHeight());
     }
 
-    // 3) AppBar 驻留（缩小工作区，其他窗口让开这条边）
-    y2kAppBarDock (getTopLevelComponent(), stickBottomAligned);
-
-    // 4) 更新 UI（隐藏最小化/置顶按钮；toolbar 切换到 X + T/B）
+    // 3) 更新 UI（隐藏最小化/置顶按钮；toolbar 切换到 X + T/B）
     repaint();
     workspace->setStickActive (true);
 }
@@ -4134,10 +3864,24 @@ void Y2KmeterAudioProcessorEditor::exitStickMode()
 {
     if (! stickActive) return;
 
+    // Hide 态下退出：先展开 → 退出 stick（恢复 Show 态备份）→ 再收起
+    if (workspace != nullptr && ! workspace->isChromeVisible())
+    {
+        workspace->setChromeVisible (true);
+        exitStickMode();
+        workspace->setChromeVisible (false);
+        revealArmed = true;
+        return;
+    }
+
     // 1) 取消 AppBar（恢复工作区）
     y2kAppBarUndock (getTopLevelComponent());
 
     stickActive = false;
+    stickDockedHeightPx  = 0;
+    stickPendingHeightPx = 0;
+    stickStableTicks     = 0;
+    stickDockRectPx      = {};
 
     // 1.5) 恢复 resizeLimits（解除宽度锁定）
     setResizeLimits (stickSavedMinW, stickSavedMinH, stickSavedMaxW, stickSavedMaxH);
@@ -4150,8 +3894,16 @@ void Y2KmeterAudioProcessorEditor::exitStickMode()
         if (! stickBackupWindowBounds.isEmpty())
             top->setBounds (stickBackupWindowBounds);
 
+    // 2.5) 备份布局里 floating=true 的模块恢复成浮动窗口。
+    //      stick 期间一直悬浮的模块（同 moduleId）会被跳过，不会重复创建。
+    restoreFloatingWindowsFromWorkspace();
+
     stickBackupLayout       = juce::ValueTree();
     stickBackupWindowBounds = {};
+
+    // 窗口已搬回原位后再恢复"最小可见量"（此时 JUCE 缓存的 userArea 可能仍是
+    //   被占位压缩过的旧值，过早恢复会把刚还原的窗口夹下去）
+    setStickOnscreenRelaxed (false);
 
     // 3) 更新 UI
     repaint();
@@ -4163,31 +3915,106 @@ void Y2KmeterAudioProcessorEditor::toggleStickTopBottom()
 {
     if (! stickActive) return;
 
+    // Hide 态下切边：先展开（预设按 Show 态计算条高）→ 切边 → 再收起
+    if (workspace != nullptr && ! workspace->isChromeVisible())
+    {
+        workspace->setChromeVisible (true);
+        toggleStickTopBottom();
+        workspace->setChromeVisible (false);
+        revealArmed = true;
+        return;
+    }
+
+    // 先撤销上一次驻留：让工作区恢复，避免 applyLayoutPreset 基于"被自己压小"
+    // 的 userArea 计算贴顶/贴底位置（否则窗口会落在 y=250 这类偏移位置，
+    // 再 dock 时系统把 [屏幕顶..窗口底] 整段算成占位 → 顶部空出 2 倍高度）。
+    y2kAppBarUndock (getTopLevelComponent());
+
     stickBottomAligned = ! stickBottomAligned;
 
     applyLayoutPreset ((int) (stickBottomAligned
         ? ModuleWorkspace::LayoutPreset::horizontalBottom
         : ModuleWorkspace::LayoutPreset::horizontalFull));
 
-    y2kAppBarDock (getTopLevelComponent(), stickBottomAligned);
+    if (y2kAppBarDock (getTopLevelComponent(), stickBottomAligned, &stickDockRectPx))
+    {
+        stickDockedHeightPx  = y2kGetWindowHeightPx (getTopLevelComponent());
+        stickPendingHeightPx = stickDockedHeightPx;
+        stickStableTicks     = 0;
+    }
+}
+
+void Y2KmeterAudioProcessorEditor::updateStickDockGeometry()
+{
+    if (! stickActive)
+        return;
+
+    auto* top = getTopLevelComponent();
+    const auto winRect = y2kGetWindowRectPx (top);
+    const int h = winRect.getHeight();
+    if (h <= 0)
+        return;
+
+    // 1) 高度变化（用户拖拽调高/调低）：等稳定 2 个 tick（10Hz → ~200ms）后重新 SETPOS，
+    //    让系统工作区占位跟着窗口高度走。
+    if (h != stickDockedHeightPx)
+    {
+        if (h != stickPendingHeightPx)
+        {
+            stickPendingHeightPx = h;
+            stickStableTicks     = 0;
+            return;
+        }
+
+        if (++stickStableTicks < 2)
+            return;
+
+        stickStableTicks = 0;
+
+        if (y2kAppBarDock (top, stickBottomAligned, &stickDockRectPx))
+        {
+            stickDockedHeightPx  = y2kGetWindowHeightPx (top);
+            stickPendingHeightPx = stickDockedHeightPx;
+        }
+
+        return;
+    }
+
+    stickPendingHeightPx = h;
+    stickStableTicks     = 0;
+
+    // 2) 高度没变但窗口被挪走了（JUCE 的 constrainer 在窗口尺寸变化后会用
+    //    display->userArea 重新夹一次顶层窗口位置，把窗口推到工作区顶边 = 占位厚度）：
+    //    直接搬回上次提交的驻留矩形，保证窗口与占位始终重合。
+    if (! stickDockRectPx.isEmpty() && winRect != stickDockRectPx)
+        y2kMoveWindowToRectPx (top, stickDockRectPx);
 }
 #endif
 
 // ==========================================================
-// 布局锁定按钮（v1.8.3 新增）
-//   · 切换 layoutLocked 状态；同步 workspace / Processor 持久化 / 顶层窗口 resize 上下限。
-//   · 生效范围：
-//       1) 顶层窗口不可拖动（Editor::mouseDown 在锁定态跳过 startDraggingComponent）
-//       2) 顶层窗口不可 resize（setResizeLimits(w,h,w,h) 夹紧当前尺寸；不 recreatePeer）
-//       3) 模块 tile 不可拖动/缩放/关闭（ModulePanel/VirtuPet mouseDown 锁定态早退）
-//       4) 拼豆贴画不可拖动/缩放/滑块拖动/添加（ModuleWorkspace::mouseDown 锁定态早退）
-//       5) 空白区右键"添加模块"菜单/双击"添加"/文件拖入 均被阻断
-//   · 关闭 / 固定 / 最小化 / 双击标题栏切换全屏 均**不**受锁定影响
-//     （这些是"窗口生命周期 / 窗口尺寸档位"级操作，与"用户手动布局"语义不同）。
-//   · 关键实现细节（v1.8.3 踩坑）：**不能**调用 juce::ResizableWindow::setResizable
-//     来切换锁定 —— 该函数内部会 recreateDesktopWindow()，直接导致窗口在切换瞬间
-//     隐藏一帧再重建，用户看到的就是"闪现消失再出现"。改走 setResizeLimits：
-//     锁定时把 min/max 都夹到"当前尺寸"，corner resizer 图标即使还在，也拉不动。
+// 窗口行为模型（v2.8.2 重构）
+// ----------------------------------------------------------
+//   ① L（布局锁定）—— 纯"交互闸门"：
+//        · 禁止拖动窗口（mouseDown 不启动 windowDragger）
+//        · 禁止用户缩放窗口（禁用 Editor / 顶层窗口上的缩放手柄）
+//        · 禁止编辑模块 / 贴画（workspace->setLayoutLocked）
+//      **不再**修改任何 resizeLimits、**不再**移动/缩放窗口。
+//      旧实现靠 setResizeLimits(w,h,w,h) 锁尺寸，副作用是 setBoundsConstrained 会
+//      把窗口夹进工作区（stick 下被推下去）、Hide 期间的尺寸快照与锁冲突（解锁后
+//      拖不动 / 拖动后被拉回原位）。闸门模式从根上消除这些耦合。
+//
+//   ② Hide —— 标题栏 + 工具栏收起：
+//        · 进入/退出：基于"当前"窗口一次性收缩/展开 chrome 高度（不再使用旧快照）。
+//          锚点：stick 时固定驻留边；否则上半屏固定顶边、下半屏固定底边。
+//        · 悬停：鼠标位于窗口内 → 标题栏/工具栏以浮层形式盖在内容之上；
+//          离开 → 浮层收起。整个过程窗口几何**完全不变**。
+//        · 进入 Hide 自动置顶（沿用旧行为）；不再强制 L。
+//
+//   ③ Stick —— AppBar 驻留：只有几何真正变化（进入/退出/切边/Hide 切换/
+//      用户拖高度）才重新提交占位；悬停浮层不会触发任何占位变化。
+//
+//   存档兼容：ui.chromeVisible / layoutLocked / window.{x,y,w,h} 语义不变
+//   （window bounds 仍按"Show 态等效尺寸"保存，见 Y2KStandaloneApp::saveMainWindowBounds）。
 // ==========================================================
 void Y2KmeterAudioProcessorEditor::handleLockClicked()
 {
@@ -4198,95 +4025,258 @@ void Y2KmeterAudioProcessorEditor::applyLayoutLocked (bool locked, bool initial)
 {
     layoutLocked = locked;
 
-    // v1.8.3：构造期极简保护。
-    //   Editor 构造末尾会调 applyLayoutLocked(processor.getLayoutLocked(), initial=true)
-    //   来从 Processor state 恢复锁定态。此时 Editor 通常尚未 attach 到 Y2KMainWindow，
-    //   或即使已挂上，顶层窗口 getWidth()/getHeight() 仍为 0。若在这种状态下调
-    //   setResizeLimits(w,h,w,h)，会命中 ComponentBoundsConstrainer::setSizeLimits 内部
-    //   jassert(minW>0 && minH>0)，Debug 构建表现为 EXCEPTION_BREAKPOINT (0x80000003)。
-    //   保护策略：initial=true 且顶层尚未就绪时——只把状态位记下，pending 置起来，
-    //   等 visibilityChanged 阶段（顶层已挂载且尺寸稳定）再补做真正 apply。
-    //   locked=false 时构造期无事可做（constrainer 也没备份可还原），也走早退。
-    bool topReady = false;
-    if (auto* topProbe = getTopLevelComponent())
-    {
-        if (topProbe != this
-            && dynamic_cast<juce::ResizableWindow*> (topProbe) != nullptr
-            && topProbe->getWidth() > 0
-            && topProbe->getHeight() > 0)
-        {
-            topReady = true;
-        }
-    }
-
-    if (initial && (! topReady || ! locked))
-    {
-        pendingLockApplyOnAttach = locked; // 只有真的锁着才需要补做
-        return;
-    }
-
-    // 1) 复位任何进行中的窗口拖拽（避免用户按住鼠标切锁的边缘态）
+    // 复位任何进行中的窗口拖拽（避免用户按住鼠标切锁的边缘态）
     draggingWindow = false;
 
-    // 2) 同步 workspace（模块 tile / 贴画所在层）和所有浮动窗口；也让子组件的
-    //    关闭按钮 hover/press 在锁定态下不响应。
+    // 同步 workspace（模块 tile / 贴画所在层）和所有浮动窗口
     if (workspace != nullptr)
         workspace->setLayoutLocked (locked);
     for (auto& wnd : floatingWindows_)
-    {
         if (wnd != nullptr)
-            wnd->setLayoutLocked(locked);
-    }
+            wnd->setLayoutLocked (locked);
 
-    // 3) 顶层窗口尺寸约束：使用 setResizeLimits 而非 setResizable，避免 peer 重建。
-    //    · 首次进入锁定前先备份当前 min/max，解锁时还原；
-    //    · 锁定时把 min = max = 当前尺寸，用户即使拖 corner 也无法改变尺寸。
-    if (auto* top = getTopLevelComponent())
-    {
-        if (top != this)
-        {
-            if (auto* rw = dynamic_cast<juce::ResizableWindow*> (top))
-            {
-                const int w = top->getWidth();
-                const int h = top->getHeight();
-                if (w > 0 && h > 0)
-                {
-                    if (auto* cbc = rw->getConstrainer())
-                    {
-                        if (locked)
-                        {
-                            if (! savedLockLimitsValid)
-                            {
-                                savedLockMinW = cbc->getMinimumWidth();
-                                savedLockMinH = cbc->getMinimumHeight();
-                                savedLockMaxW = cbc->getMaximumWidth();
-                                savedLockMaxH = cbc->getMaximumHeight();
-                                savedLockLimitsValid = true;
-                            }
-                            rw->setResizeLimits (w, h, w, h);
-                        }
-                        else
-                        {
-                            if (savedLockLimitsValid)
-                            {
-                                rw->setResizeLimits (savedLockMinW, savedLockMinH,
-                                                     savedLockMaxW, savedLockMaxH);
-                                savedLockLimitsValid = false;
-                            }
-                        }
-                        pendingLockApplyOnAttach = false;
-                    }
-                }
-            }
-        }
-    }
+    applyUserResizeGate();
 
-    // 4) 持久化：把布局锁定态写回 Processor（初次由 Processor state 驱动时不写回）
+    // 持久化：初次由 Processor state 驱动时不写回
     if (! initial)
         processor.setLayoutLocked (locked);
 
-    // 5) 视觉反馈：重绘标题栏，让 lock 按钮显示为 pressed-latched 或 raised。
     repaint (getTitleBarBounds());
+}
+
+void Y2KmeterAudioProcessorEditor::applyUserResizeGate()
+{
+    // 插件宿主：窗口尺寸归宿主管理，保持旧行为（L 只锁模块编辑）
+    if (isPluginHost)
+        return;
+
+    const bool allow = ! layoutLocked;
+
+    auto gate = [allow] (juce::Component& parent)
+    {
+        for (auto* c : parent.getChildren())
+        {
+            if (dynamic_cast<juce::ResizableCornerComponent*> (c) != nullptr
+                || dynamic_cast<juce::ResizableBorderComponent*> (c) != nullptr)
+            {
+                c->setInterceptsMouseClicks (allow, false);
+                c->setAlpha (allow ? 1.0f : 0.0f);
+            }
+        }
+    };
+
+    gate (*this);
+    if (auto* top = getTopLevelComponent())
+        if (top != this)
+            gate (*top);
+}
+
+// AudioProcessorEditor::setResizeLimits 每次都会重建右下角缩放手柄 →
+//   在子组件变化时重新套一次闸门，保证 L 状态始终生效。
+void Y2KmeterAudioProcessorEditor::childrenChanged()
+{
+    juce::AudioProcessorEditor::childrenChanged();
+    applyUserResizeGate();
+}
+
+int Y2KmeterAudioProcessorEditor::getChromeHeightPx() const noexcept
+{
+    // 必须与 Y2KStandaloneApp::saveMainWindowBounds 的 kChromeShrink 保持一致
+    constexpr int kToolbarHeight = 36;   // == ModuleWorkspace::toolbarHeight
+    return PinkXP::ui (titleBarHeight) + PinkXP::ui (kToolbarHeight);
+}
+
+void Y2KmeterAudioProcessorEditor::setAutoHideMode (bool shouldHide)
+{
+    if (autoHideMode == shouldHide && chromeDim == shouldHide)
+    {
+        if (workspace != nullptr)
+            workspace->setAutoHideActive (shouldHide);
+        return;
+    }
+
+    // 切换态时清空按钮 hover/pressed 残留
+    closeButtonHovered = closeButtonPressed = false;
+    pinButtonHovered   = pinButtonPressed   = false;
+    minButtonHovered   = minButtonPressed   = false;
+    lockButtonHovered  = lockButtonPressed  = false;
+    titleTextHovered   = false;
+    draggingWindow     = false;
+
+    // 浮层只属于 Hide 态：任何切换都先收起
+    setChromeRevealed (false);
+
+    autoHideMode = shouldHide;
+    if (workspace != nullptr)
+        workspace->setAutoHideActive (shouldHide);
+
+    auto* top = getTopLevelComponent();
+    const bool canResizeWindow = ! isPluginHost
+                                 && juce::JUCEApplicationBase::isStandaloneApp()
+                                 && top != nullptr && top != this
+                                 && isShowing()
+                                 && ! pseudoFullScreen;
+
+    const int chromeH = getChromeHeightPx();
+
+    auto restoreEditorLimits = [this]
+    {
+        if (! hideLimitsSaved)
+            return;
+        hideLimitsSaved = false;
+        setResizeLimits (hideSavedMinW, hideSavedMinH, hideSavedMaxW, hideSavedMaxH);
+    };
+
+    if (canResizeWindow)
+    {
+        const auto b = top->getBounds();
+
+        bool anchorBottom = false;
+       #if JUCE_WINDOWS
+        if (stickActive)
+            anchorBottom = stickBottomAligned;
+        else
+       #endif
+        {
+            const auto* d = juce::Desktop::getInstance().getDisplays().getDisplayForRect (b);
+            const auto userArea = (d != nullptr) ? d->userArea : b;
+            anchorBottom = b.getCentreY() > userArea.getCentreY();
+        }
+
+        const int newH = shouldHide ? juce::jmax (1, b.getHeight() - chromeH)
+                                    : b.getHeight() + chromeH;
+        const juce::Rectangle<int> nb (b.getX(),
+                                       anchorBottom ? b.getBottom() - newH : b.getY(),
+                                       b.getWidth(), newH);
+
+        if (shouldHide)
+        {
+            // 只放宽 Editor 最小高度（宽度/最大值保持，stick 的宽度锁也因此保留），
+            //   否则用户在 Hide 下拖缩放手柄时会被旧的 minH 一把拉回。
+            if (! hideLimitsSaved)
+            {
+                if (auto* c = getConstrainer())
+                {
+                    hideSavedMinW = c->getMinimumWidth();
+                    hideSavedMinH = c->getMinimumHeight();
+                    hideSavedMaxW = c->getMaximumWidth();
+                    hideSavedMaxH = c->getMaximumHeight();
+                    hideLimitsSaved = true;
+                    setResizeLimits (hideSavedMinW, juce::jmax (1, hideSavedMinH - chromeH),
+                                     hideSavedMaxW, hideSavedMaxH);
+                }
+            }
+
+            chromeDim = true;
+            top->setBounds (nb);
+        }
+        else
+        {
+            chromeDim = false;
+            top->setBounds (nb);
+            restoreEditorLimits();
+        }
+
+       #if JUCE_WINDOWS
+        if (stickActive)
+            redockStickAfterGeometryChange();
+       #endif
+    }
+    else
+    {
+        chromeDim = shouldHide;
+        if (! shouldHide)
+            restoreEditorLimits();
+    }
+
+    if (chromeHiddenOverlay != nullptr)
+        chromeHiddenOverlay->setVisible (chromeDim);
+
+    resized();
+    updateWorkspaceHitTestHoles();
+    repaint();
+
+    if (shouldHide)
+    {
+        // 沿用旧行为：进入 Hide 自动置顶
+        setAlwaysOnTopActive (true);
+
+        // 刚点完 Hide 鼠标还在窗口内：需先离开一次再进入才浮现，避免"点了没反应"的错觉
+        revealArmed        = false;
+        revealLastInsideMs = 0;
+        chromeRevealPoller.callback = [this] { updateChromeReveal(); };
+        chromeRevealPoller.startTimerHz (30);
+    }
+    else
+    {
+        chromeRevealPoller.stopTimer();
+    }
+}
+
+void Y2KmeterAudioProcessorEditor::setChromeRevealed (bool shouldReveal)
+{
+    if (! autoHideMode || ! chromeDim)
+        shouldReveal = false;
+
+    if (chromeRevealed == shouldReveal)
+        return;
+
+    chromeRevealed = shouldReveal;
+
+    closeButtonHovered = closeButtonPressed = false;
+    pinButtonHovered   = pinButtonPressed   = false;
+    minButtonHovered   = minButtonPressed   = false;
+    lockButtonHovered  = lockButtonPressed  = false;
+    titleTextHovered   = false;
+
+    if (workspace != nullptr)
+    {
+        workspace->setToolbarOverlayRevealed (shouldReveal);
+        workspace->setOverlayPassThroughRect (shouldReveal
+            ? getTitleBarBounds().withTrimmedBottom (-1) - workspace->getPosition()
+            : juce::Rectangle<int>());
+    }
+
+    if (chromeHiddenOverlay != nullptr)
+        chromeHiddenOverlay->setVisible (chromeDim && ! shouldReveal);
+
+    updateWorkspaceHitTestHoles();
+    repaint();
+}
+
+void Y2KmeterAudioProcessorEditor::updateChromeReveal()
+{
+    if (! autoHideMode)
+    {
+        chromeRevealPoller.stopTimer();
+        return;
+    }
+
+    auto* top = getTopLevelComponent();
+    if (top == nullptr)
+        return;
+
+    const auto area  = top->getScreenBounds();
+    const auto mouse = juce::Desktop::getInstance().getMainMouseSource().getScreenPosition().roundToInt();
+    const bool inside = top->isShowing() && area.contains (mouse);
+    const auto now = juce::Time::getMillisecondCounter();
+
+    if (inside)
+        revealLastInsideMs = now;
+    else
+        revealArmed = true;
+
+    // 正在交互（按住鼠标拖拽 / 下拉菜单、对话框打开）时维持当前状态，
+    //   避免拖窗口或选菜单项的过程中浮层突然消失。
+    const bool busy = juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown()
+                      || juce::ModalComponentManager::getInstance()->getNumModalComponents() > 0;
+    if (busy)
+        return;
+
+    if (inside && revealArmed)
+        setChromeRevealed (true);
+    else if (! inside && chromeRevealed && now - revealLastInsideMs > 250)
+        setChromeRevealed (false);   // 250ms 宽限：鼠标擦过窗口边缘不闪烁
 }
 void Y2KmeterAudioProcessorEditor::RestoreFpsLimit (int hz)
 {
@@ -4318,7 +4308,8 @@ void Y2KmeterAudioProcessorEditor::updateWorkspaceHitTestHoles()
         return;
     }
 
-    if (! chromeDim)
+    // 常驻态 / Hide 悬停浮层态：标题栏由 Editor 直接处理（浮层态靠 passThroughRect），无需挖洞
+    if (! chromeDim || chromeRevealed)
     {
         workspace->setHitTestHoles ({});
         return;
@@ -4382,9 +4373,9 @@ void Y2KmeterAudioProcessorEditor::mouseMove(const juce::MouseEvent& e)
         if (h != state) { state = h; repaint (rc); }
     };
 
-    if (chromeDim)
+    if (chromeDim && ! chromeRevealed)
     {
-        // chrome 隐藏态：Editor 负责处理"浮动关闭按钮 / 标题文字"的 hover，
+        // chrome 隐藏态（未悬停）：Editor 负责处理"浮动关闭按钮 / 标题文字"的 hover，
         //   workspace 已通过 hit-test 挖洞让这些事件冒泡过来；视觉状态由 overlay 负责绘制。
         if (chromeHiddenOverlay == nullptr)
             return;
@@ -4442,26 +4433,10 @@ void Y2KmeterAudioProcessorEditor::mouseMove(const juce::MouseEvent& e)
     }
 }
 
-// v1.8.6：auto-hide 模式下的 mouseEnter —— 鼠标悬停暂时恢复 chrome
+// v2.8.2：Hide 悬停改由 updateChromeReveal 轮询，mouseEnter 只记录状态
 void Y2KmeterAudioProcessorEditor::mouseEnter(const juce::MouseEvent&)
 {
     mouseInsideEditor = true;
-
-    // 布局预设切换期间抑制 auto-show（见 onLayoutPresetChanged）
-    if (suppressAutoShowCounter > 0)
-        return;
-
-    // Hide 后必须等鼠标先离开窗口一次，才允许鼠标再次进入时触发 hover show
-    if (autoHideNeedsExitFirst)
-        return;
-
-    // 仅在 auto-hide 模式 + chrome 当前隐藏时：暂时显示 chrome（保持 lock+pin）
-    if (autoHideMode && workspace != nullptr && ! workspace->isChromeVisible())
-    {
-        temporaryChromeShow = true;
-        workspace->setChromeVisible (true);
-        temporaryChromeShow = false;
-    }
 }
 
 void Y2KmeterAudioProcessorEditor::mouseExit(const juce::MouseEvent& e)
@@ -4503,30 +4478,7 @@ void Y2KmeterAudioProcessorEditor::mouseExit(const juce::MouseEvent& e)
         chromeHiddenOverlay->setTitleTextHovered (false);
     }
 
-    // v1.8.6：auto-hide 模式下鼠标离开窗口 → 重新隐藏 chrome（保持 lock+pin）
-    //   · 必须检查鼠标屏幕坐标是否真正离开了顶层窗口。
-    //   · 用户从抬头区移到模块/工具栏区也会触发 Editor::mouseExit，
-    //     仅靠组件边界判断会误隐藏——必须用屏幕坐标最终裁决。
-    //   · chrome 隐藏时真正离开也要清零 autoHideNeedsExitFirst，
-    //     否则下次 mouseEnter 永远被拦截。
-    //   · 使用 MouseEvent 的屏幕坐标而非 Desktop::getMainMouseSource()
-    //     （后者在高速移动时可能返回 stale 坐标）。
-    if (autoHideMode)
-    {
-        auto* top = getTopLevelComponent();
-        if (top != nullptr)
-        {
-            const auto mouseScreen = e.getScreenPosition().toInt();
-            const auto topScreenBounds = (top == this) ? getScreenBounds() : top->getScreenBounds();
-            if (! topScreenBounds.contains (mouseScreen))
-            {
-                if (workspace != nullptr && workspace->isChromeVisible())
-                    workspace->setChromeVisible (false);
-                autoHideNeedsExitFirst = false;
-            }
-        }
-    }
-
+    juce::ignoreUnused (e);
     mouseInsideEditor = false;
 }
 
@@ -4546,8 +4498,9 @@ void Y2KmeterAudioProcessorEditor::mouseDown(const juce::MouseEvent& e)
         return;
     }
 
-    // chrome 隐藏态：仅处理浮动关闭按钮 + 标题文字点击；其他区域不处理（也不支持从顶部拖窗口）
-    if (chromeDim)
+    // chrome 隐藏态（未悬停）：仅处理浮动关闭按钮 + 标题文字点击；
+    //   悬停浮层显示时标题栏完整可用，走下方常规路径（可拖窗、可点 L/置顶/最小化/关闭）。
+    if (chromeDim && ! chromeRevealed)
     {
         if (chromeHiddenOverlay == nullptr) return;
 
@@ -4619,9 +4572,9 @@ void Y2KmeterAudioProcessorEditor::mouseDown(const juce::MouseEvent& e)
 
     if (juce::JUCEApplicationBase::isStandaloneApp())
     {
-        // 锁定态 / stick 驻留态：不启动顶层窗口拖拽。双击全屏的前置 mouseDown
-        //   不会受影响，因为下面不会将 draggingWindow 置 true，mouseDrag 也不会拖。
-        //   双击全屏本身仍允许（属于"窗口尺寸"而非"用户拖拽"）。
+        // 锁定态 / stick 驻留态：不启动顶层窗口拖拽。
+        //   stick 驻留态的几何由 AppBar 管理，拖动会与占位脱节；双击全屏也会
+        //   破坏贴边矩形，因此 mouseDoubleClick 里同样对 stickActive 早退。
         if (! layoutLocked && ! stickActive)
         {
             if (auto* top = getTopLevelComponent())
@@ -4711,7 +4664,7 @@ void Y2KmeterAudioProcessorEditor::mouseUp(const juce::MouseEvent& e)
 
         // 根据当前 chrome 状态决定使用"浮动关闭按钮"还是"标题栏内的关闭按钮"的几何
         juce::Rectangle<int> rc;
-        if (chromeDim && chromeHiddenOverlay != nullptr)
+        if (chromeDim && ! chromeRevealed && chromeHiddenOverlay != nullptr)
         {
             rc = chromeHiddenOverlay->getFloatingCloseButtonRect()
                     .translated (chromeHiddenOverlay->getX(),
@@ -4778,7 +4731,12 @@ void Y2KmeterAudioProcessorEditor::mouseUp(const juce::MouseEvent& e)
 void Y2KmeterAudioProcessorEditor::mouseDoubleClick (const juce::MouseEvent& e)
 {
     if (isPluginHost) return;
+    // Hide 态：浮现的标题栏只是浮层，全屏会与 Hide 的几何收缩互相干扰，不响应
     if (chromeDim)    return;
+    // L 锁定：禁止改变窗口尺寸（但允许从伪全屏还原）
+    if (layoutLocked && ! pseudoFullScreen) return;
+    // stick 驻留态：全屏会破坏 AppBar 占位（窗口脱离贴边），禁止双击全屏
+    if (stickActive)  return;
 
     // 命中区域：仅标题栏矩形，且不落在三个按钮 + 标题文字热区
     const auto pos = e.getPosition();
@@ -4923,26 +4881,8 @@ void Y2KmeterAudioProcessorEditor::toggleFakeFullScreen()
 
         pseudoFullScreen = false;
 
-        // 2) 恢复 resize limits：
-        //    · 若当前处于 layoutLocked → 让 applyLayoutLocked(true) 按新尺寸重新锁死；
-        //    · 否则还原到进入前的 limits。
-        if (layoutLocked)
-        {
-            // 让 applyLayoutLocked 在退出后按恢复的 bounds 重新 setResizeLimits(w,h,w,h)。
-            // 先清掉 savedLockLimitsValid 使其重新采样一份"进入锁定前"的 limits，
-            // 用我们本次保存的 preFullScreen* 作为真值，避免用被覆盖过的错误值。
-            if (preFullScreenLimitsValid)
-            {
-                savedLockMinW = preFullScreenMinW;
-                savedLockMinH = preFullScreenMinH;
-                savedLockMaxW = preFullScreenMaxW;
-                savedLockMaxH = preFullScreenMaxH;
-                savedLockLimitsValid = true;
-            }
-            layoutLocked = false;              // applyLayoutLocked(true) 会重新写 min=max=当前尺寸
-            applyLayoutLocked (true, /*initial*/ false);
-        }
-        else if (preFullScreenLimitsValid)
+        // 2) 还原进入前的 resize limits（v2.8.2：L 不再改写 limits，无需特殊处理）
+        if (preFullScreenLimitsValid)
         {
             const int minW = juce::jmax (1, preFullScreenMinW);
             const int minH = juce::jmax (1, preFullScreenMinH);
@@ -4999,6 +4939,12 @@ void Y2KmeterAudioProcessorEditor::timerCallback()
     //   拖到另一台显示器时 Editor::moved() 不会触发，因此必须用轮询兜底。
     updateUiScaleForCurrentDisplay();
 
+#if JUCE_WINDOWS
+    // stick 驻留态：窗口高度被改动 / 窗口被挪走时，重新对齐 AppBar 占位。
+    if (stickActive)
+        updateStickDockGeometry();
+#endif
+
     // 10Hz 拉取宿主自动化参数 → 应用到 Milkdrop 渲染（仅插件宿主形态）。
     if (isPluginHost)
     {
@@ -5032,54 +4978,9 @@ void Y2KmeterAudioProcessorEditor::timerCallback()
     }
 #endif
 
-    // v1.8.6：递减 auto-show 抑制计数器（用于 onChromeVisibleChanged 异步事件窗口保护）
-    if (suppressAutoShowCounter > 0)
-        --suppressAutoShowCounter;
-
     // v1.9.x：新手引导 STEP 2 条件检查（孵化完成检测）
     if (! isPluginHost)
         checkTutorialStep2Condition();
-
-    // v1.8.6：焦点保护 —— timer 轮询检测前台状态，弥补 mouseExit 漏判场景
-    //   · 始终追踪 windowWasForeground（即使 autoHideMode 为 false），确保首次 HIDE
-    //     时前台状态已同步，避免因初始值 false 导致误触发 auto-show。
-    //   · 仅当 autoHideMode 活跃时才执行 hide/show 动作。
-    //   · Timer 周期为 ~100ms（startTimerHz(10)），响应延时 < 200ms，用户感知不明显。
-    {
-        auto* top = getTopLevelComponent();
-        if (top != nullptr)
-        {
-            auto* focused = juce::Component::getCurrentlyFocusedComponent();
-            const bool isForeground = (focused != nullptr
-                                       && focused->getTopLevelComponent() == top);
-            if (isForeground != windowWasForeground)
-            {
-                windowWasForeground = isForeground;
-                if (autoHideMode)
-                {
-                    if (isForeground)
-                    {
-                        // 用户切回本软件 → auto-show（模拟 hover show 行为）
-                        if (! workspace->isChromeVisible()
-                            && suppressAutoShowCounter == 0)
-                        {
-                            temporaryChromeShow = true;
-                            workspace->setChromeVisible (true);
-                            temporaryChromeShow = false;
-                        }
-                        autoHideNeedsExitFirst = false;
-                    }
-                    else
-                    {
-                        // 用户切到别的软件 → auto-hide
-                        if (workspace->isChromeVisible())
-                            workspace->setChromeVisible (false);
-                        autoHideNeedsExitFirst = true;
-                    }
-                }
-            }
-        }
-    }
 
     // 仅当存在 VirtuPet 模块时，才保活/计算对应的音频信号。
     const int n = workspace->getNumModules();
