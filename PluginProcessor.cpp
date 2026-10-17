@@ -204,8 +204,7 @@ void Y2KmeterAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 
     // 前置增益变化后，在音频线程安全重置 loudness（含 LUFS-I 积分）
-    if (pendingLoudnessReset.exchange (false, std::memory_order_relaxed))
-        analyserHub->resetLoudness();
+    consumePendingLoudnessReset();
 
     const int totalIn  = getTotalNumInputChannels();
     const int totalOut = getTotalNumOutputChannels();
@@ -401,6 +400,12 @@ float Y2KmeterAudioProcessor::getAnalysisInputGainDb() const noexcept
 float Y2KmeterAudioProcessor::getAnalysisInputGainLinear() const noexcept
 {
     return analysisInputGainLin.load (std::memory_order_relaxed);
+}
+
+void Y2KmeterAudioProcessor::consumePendingLoudnessReset() noexcept
+{
+    if (pendingLoudnessReset.exchange (false, std::memory_order_relaxed))
+        analyserHub->resetLoudness();
 }
 
 juce::File Y2KmeterAudioProcessor::exportPerfCountersNow()

@@ -1647,6 +1647,9 @@ private:
 
             if (! y2kProc->isAnalysisActive()) return;
 
+            // 前置增益变更后需要重算 LUFS-I；loopback 采集期间 processBlock 不运行
+            y2kProc->consumePendingLoudnessReset();
+
             // 度量 Loopback 路径的 CPU 占比（否则 processBlock 不跑，UI CPU 一直 0）
             const double t0 = juce::Time::getMillisecondCounterHiRes();
             const float gainLin = y2kProc->getAnalysisInputGainLinear();
@@ -1656,15 +1659,18 @@ private:
             }
             else
             {
-                juce::HeapBlock<float> tmpL, tmpR;
-                tmpL.malloc ((size_t) n);
-                tmpR.malloc ((size_t) n);
-                for (int i = 0; i < n; ++i)
-                {
-                    tmpL[i] = L[i] * gainLin;
-                    tmpR[i] = R[i] * gainLin;
-                }
-                y2kProc->getAnalyserHub().pushStereo (tmpL.get(), tmpR.get(), n);
+                // 预分配缓冲，避免采集线程逐块堆分配
+                if (loopbackGainScratch.getNumSamples() < n)
+                    loopbackGainScratch.setSize (2, n, false, false, true);
+
+                loopbackGainScratch.copyFrom (0, 0, L, n);
+                loopbackGainScratch.copyFrom (1, 0, R, n);
+                loopbackGainScratch.applyGain (0, 0, n, gainLin);
+                loopbackGainScratch.applyGain (1, 0, n, gainLin);
+
+                y2kProc->getAnalyserHub().pushStereo (loopbackGainScratch.getReadPointer (0),
+                                                      loopbackGainScratch.getReadPointer (1),
+                                                      n);
             }
             const double elapsedMs = juce::Time::getMillisecondCounterHiRes() - t0;
             y2kProc->registerLoopbackRenderTime (elapsedMs, n, sr);
@@ -1847,8 +1853,32 @@ private:
 
             if (! y2kProc->isAnalysisActive()) return;
 
+            // 前置增益变更后需要重算 LUFS-I；SCK 采集期间 processBlock 不运行，
+            //   因此在这里显式消费一次挂起的重置请求。
+            y2kProc->consumePendingLoudnessReset();
+
             const double t0 = juce::Time::getMillisecondCounterHiRes();
-            y2kProc->getAnalyserHub().pushStereo (L, R, n);
+            const float gainLin = y2kProc->getAnalysisInputGainLinear();
+            if (std::abs (gainLin - 1.0f) < 0.0001f)
+            {
+                y2kProc->getAnalyserHub().pushStereo (L, R, n);
+            }
+            else
+            {
+                // 应用与 processBlock 完全一致的前置增益（仅作用于分析链路，
+                //   不改变系统实际输出音量）。
+                if (macGainScratch.getNumSamples() < n)
+                    macGainScratch.setSize (2, n, false, false, true);
+
+                macGainScratch.copyFrom (0, 0, L, n);
+                macGainScratch.copyFrom (1, 0, R, n);
+                macGainScratch.applyGain (0, 0, n, gainLin);
+                macGainScratch.applyGain (1, 0, n, gainLin);
+
+                y2kProc->getAnalyserHub().pushStereo (macGainScratch.getReadPointer (0),
+                                                      macGainScratch.getReadPointer (1),
+                                                      n);
+            }
             const double elapsedMs = juce::Time::getMillisecondCounterHiRes() - t0;
             y2kProc->registerLoopbackRenderTime (elapsedMs, n, sr);
         };
@@ -1925,9 +1955,18 @@ private:
     std::atomic<bool>                               loopbackActive { false };
     std::atomic<double>                             loopbackLastSampleRate { 0.0 };
 
+    // WASAPI 采集线程应用前置增益用的临时缓冲（与 macGainScratch 同思路）。
+    //   只在采集线程内访问，预分配后避免逐块堆分配。
+    juce::AudioBuffer<float>                        loopbackGainScratch;
+
    #if JUCE_MAC
     // macOS：基于 ScreenCaptureKit 的桌面音频采集（替代 WASAPI loopback）
     std::unique_ptr<MacDesktopAudioCapture>         macDesktopCapture;
+
+    // SCK 采集线程应用前置增益用的临时缓冲。
+    //   只在 gain != 1.0 时使用；预分配后在采样率/块长变化时才扩容，
+    //   避免在每个采集块里做堆分配。仅采集线程访问，无需加锁。
+    juce::AudioBuffer<float>                        macGainScratch;
    #endif
 
     // 非 Windows 的 "Output" 语义通过虚拟回环输入设备实现。

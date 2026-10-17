@@ -97,6 +97,13 @@ public:
     float getAnalysisInputGainDb() const noexcept;
     float getAnalysisInputGainLinear() const noexcept;
 
+    // 消费挂起的 Loudness 重置请求（LUFS-I 归零重算）。
+    //   · 常规插件/设备输入模式下由 processBlock 自动调用；
+    //   · 当音频不经过 processBlock 时（macOS ScreenCaptureKit 桌面采集、
+    //     Windows WASAPI loopback），必须由采集回调显式调用一次，
+    //     否则改增益后 LUFS-I 积分不会重新开始。
+    void consumePendingLoudnessReset() noexcept;
+
     // ---- 全局性能计数器控制 ----
     juce::File exportPerfCountersNow();
     void setPerfAutoExportEnabled(bool enabled) noexcept;
