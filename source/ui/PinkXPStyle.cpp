@@ -47,6 +47,19 @@ namespace PinkXP
     // ==========================================================
     static float gUiScale = 1.0f;
 
+    // stick 驻留态（Windows AppBar）：供 LnF 调整 PopupMenu / ComboBox 的弹出锚点
+    static bool gStickDockActive = false;
+    static bool gStickDockBottom = false;
+
+    void setStickDockState (bool active, bool bottom) noexcept
+    {
+        gStickDockActive = active;
+        gStickDockBottom = active && bottom;
+    }
+
+    bool isStickDockActive() noexcept { return gStickDockActive; }
+    bool isStickDockBottom() noexcept { return gStickDockBottom; }
+
     float uiScale() noexcept { return gUiScale; }
 
     void setUiScale (float s) noexcept
@@ -59,14 +72,15 @@ namespace PinkXP
         return juce::jmax (1, juce::roundToInt ((float) px * uiScale()));
     }
 
-    float uiScaleForDisplay (const juce::Rectangle<int>& userArea) noexcept
+    float uiScaleForDisplay (const juce::Rectangle<int>& displayArea) noexcept
     {
-        const int w = userArea.getWidth();
-        const int h = userArea.getHeight();
+        const int w = displayArea.getWidth();
+        const int h = displayArea.getHeight();
         const int minDim = juce::jmin (w, h);
 
-        // 按"逻辑分辨率"分级（JUCE 的 userArea 已是 DPI 缩放后的逻辑像素，
-        // 直接反映可用的界面空间大小）：
+        // 按"显示屏逻辑分辨率"分级（传 totalArea —— 不要传 userArea：
+        //   后者会被任务栏 / 自己的 AppBar 驻留压缩，stick 条拉高时会误判为矮屏）。
+        // JUCE 的显示器尺寸已是 DPI 缩放后的逻辑像素：
         //   · ≤720 / ≤768 矮屏：1280×720、1024×768 等 → 0.75 紧凑
         //   · ≤800：1366×768、1280×800 等 → 0.8
         //   · ≤900：1440×900、1600×900 等 → 0.9
@@ -1526,6 +1540,38 @@ void PinkXPLookAndFeel::positionComboBoxText(juce::ComboBox& box, juce::Label& l
     label.setFont(getComboBoxFont(box));
     label.setColour(juce::Label::textColourId,
                     box.findColour(juce::ComboBox::textColourId));
+}
+
+juce::PopupMenu::Options PinkXPLookAndFeel::getOptionsForComboBoxPopupMenu (juce::ComboBox& box,
+                                                                            juce::Label& label)
+{
+    auto options = juce::LookAndFeel_V4::getOptionsForComboBoxPopupMenu (box, label);
+
+    if (! PinkXP::isStickDockActive())
+        return options;
+
+    // stick 驻留态：JUCE 默认把菜单 clamp 到 display->userArea，而 AppBar 驻留
+    //   正好把条带从工作区里挖掉了 —— 下拉框位于条带内（userArea 之外）时，
+    //   菜单会被整体推到条带上方，离控件很远。这里把允许区域放宽到整个显示器，
+    //   让菜单按默认逻辑贴着下拉框展开（可以盖在条带上）。
+    const auto boxScreen = box.getScreenBounds();
+    const auto display = juce::Desktop::getInstance().getDisplays()
+                             .getDisplayForPoint (boxScreen.getCentre());
+    if (display == nullptr)
+        return options;
+
+    // 工作区内的下拉（例如浮动窗口）不受影响，保持默认锚点与约束。
+    if (display->userArea.contains (boxScreen.getCentre()))
+        return options;
+
+   #if JUCE_WINDOWS
+    // withParentAreaOverride 是本仓库 JUCE 的本地扩展（见 juce_PopupMenu.h）。
+    //   这里用平台宏包住，保证 macOS 端即使链接官方 JUCE 也能编译。
+    return options.withParentAreaOverride (
+        display->safeAreaInsets.subtractedFrom (display->totalArea));
+   #else
+    return options;
+   #endif
 }
 
 PinkXPLookAndFeel& getPinkXPLookAndFeel()

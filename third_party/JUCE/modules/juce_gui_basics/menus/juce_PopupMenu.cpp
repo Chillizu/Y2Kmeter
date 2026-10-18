@@ -858,6 +858,11 @@ struct MenuWindow final : public Component
         auto* display = Desktop::getInstance().getDisplays().getDisplayForPoint (targetPoint * scaleFactor);
         auto parentArea = display->userArea.getIntersection (display->safeAreaInsets.subtractedFrom (display->totalArea));
 
+        // App-supplied override: allows menus to extend over desktop space that the
+        // app itself reserved (e.g. an AppBar strip carved out of the user area).
+        if (! options.getParentAreaOverride().isEmpty())
+            parentArea = options.getParentAreaOverride();
+
         if (auto* pc = options.getParentComponent())
         {
             return pc->getLocalArea (nullptr,
@@ -2126,6 +2131,11 @@ PopupMenu::Options PopupMenu::Options::withParentComponent (Component* parent) c
 PopupMenu::Options PopupMenu::Options::withPreferredPopupDirection (PopupDirection direction) const
 {
     return with (*this, &Options::preferredPopupDirection, direction);
+}
+
+PopupMenu::Options PopupMenu::Options::withParentAreaOverride (Rectangle<int> area) const
+{
+    return with (*this, &Options::parentAreaOverride, area);
 }
 
 PopupMenu::Options PopupMenu::Options::withInitiallySelectedItem (int idOfItemToBeSelected) const

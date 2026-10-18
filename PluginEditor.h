@@ -211,15 +211,45 @@ private:
     // stick 模式是否激活（Windows 专属；非 Windows 恒 false，paint 无需 #if 即可判断）
     bool isStickActive() const noexcept { return stickActive; }
 
+    // ---- 布局三槽（v2.8.5）----
+    // 当前活动槽：0 = 非 stick / 1 = stick 顶(T) / 2 = stick 底(B)。
+    //   所有"保存当前布局"的调用都必须走 persistCurrentLayoutToProcessor()，
+    //   否则 stick 期间的改动会写进非 stick 槽，把用户常驻布局污染掉。
+    int  activeLayoutSlot() const noexcept;
+    void persistCurrentLayoutToProcessor();
+
+    // 把"当前实际 stick 状态"写回 Processor。
+    //   用于导入存档后校正：存档里的 stickActive 描述的是导出方当时的状态，
+    //   直接保留会让本机下次启动莫名进入 stick。
+    void syncStickSessionFlagToProcessor();
+
 #if JUCE_WINDOWS
     // ---- stick 模式（Windows 专属：AppBar 硬 stick 驻留）----
     //   进入：备份当前布局 + 窗口 bounds → 切换 Horizontal Bar(T) → AppBar 驻留
     //         （SHAppBarMessage 缩小屏幕工作区，其他窗口被挤走）→ 隐藏最小化/置顶按钮
     //   退出：取消 AppBar → 恢复备份布局 + 窗口 bounds → 恢复按钮
     //   T/B：在顶端（horizontalFull）/ 底端（horizontalBottom）之间切换
+    //   三槽：非 stick / stick 顶 / stick 底 各自独立保存，互不覆盖。
     void enterStickMode();
     void exitStickMode();
     void toggleStickTopBottom();
+
+    // 启动时恢复上次的 stick 会话（窗口上屏后由 timerCallback 调用一次）。
+    //   · 存档里有 stickActive=true 时，loadInitialModules 已先装载对应 stick 槽；
+    //     这里补做窗口高度 + AppBar 驻留 + 按钮组切换。
+    void restoreSavedStickSession();
+    // 从存档加载指定 stick 槽（1=顶 / 2=底）；槽为空或解析失败返回 false。
+    bool loadSavedStickSlotLayout (int slot);
+
+    // 不重建模块布局，只把窗口搬到"屏幕宽 × 指定 Editor 高"并贴顶/贴底。
+    //   用于恢复存档槽（用户上次调好的条高）与启动恢复会话。
+    void applyStickBarGeometry (bool bottom, int targetEditorHeight);
+
+    // 存档用的 stick 高度：hide 态时折算回 show 态等效高度（与 chrome 展开一致）
+    int  stickEditorHeightForSave() const noexcept;
+
+    bool pendingStickRestore = false;   // 启动待恢复 stick 会话
+    bool pendingStickBottom  = false;   // 待恢复方向（false=T / true=B）
 
     // 驻留期间窗口高度被改变（用户拖拽底边）后，延时重新 SETPOS，
     // 让系统工作区占位与窗口实际高度保持一致；否则会出现空档/压住其他窗口。
@@ -626,6 +656,10 @@ private:
     // 由 workspace 的脱离态记录重建浮动窗口（启动恢复 / 退出 stick 恢复备份布局）。
     //   已存在同 moduleId 的浮动窗口会跳过，避免重复实例化。
     void restoreFloatingWindowsFromWorkspace();
+
+    // 用 Processor 里的独立存档替换 workspace 的脱离态记录（不创建窗口）。
+    //   用于导入 settings / 工程状态后重新对齐浮动模块。
+    void reloadFloatingModuleRecordsFromProcessor();
 
     // ================================================================
     // v1.9.x：新手引导（仅 Standalone 模式生效，插件宿主模式忽略）

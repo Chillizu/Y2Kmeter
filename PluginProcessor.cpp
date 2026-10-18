@@ -589,13 +589,64 @@ void Y2KmeterAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
     root.setProperty ("milkdropOffsetFoldX",   savedMilkdropVisualState_.offset.ivalue[1], nullptr);
     root.setProperty ("milkdropOffsetFoldY",   savedMilkdropVisualState_.offset.ivalue[2], nullptr);
 
-    if (savedLayoutXml.isNotEmpty())
+    // 布局三槽（v2.8.5）：
+    //   <PBEQ_Layout>             = 非 stick 槽（旧存档兼容位）
+    //   <PBEQ_LayoutStickTop>     = stick 顶(T) 槽
+    //   <PBEQ_LayoutStickBottom>  = stick 底(B) 槽
+    //   写盘时把每份布局树的根标签换成对应的槽标签，读盘时再换回
+    //   PBEQ_Layout —— ModuleWorkspace::loadLayoutFromTree 只认后者。
+    auto appendLayoutSlot = [&root] (const char* slotTag, const juce::String& layoutXml)
     {
-        if (auto layoutXml = juce::parseXML(savedLayoutXml))
+        if (layoutXml.isEmpty()) return;
+
+        if (auto parsed = juce::parseXML (layoutXml))
         {
-            const auto layoutTree = juce::ValueTree::fromXml(*layoutXml);
-            if (layoutTree.isValid())
-                root.appendChild(layoutTree, nullptr);
+            parsed->setTagName (slotTag);
+
+            auto tree = juce::ValueTree::fromXml (*parsed);
+            if (tree.isValid())
+                root.appendChild (tree, nullptr);
+        }
+    };
+
+    appendLayoutSlot ("PBEQ_Layout",            savedLayoutXml);
+    appendLayoutSlot ("PBEQ_LayoutStickTop",    savedLayoutXmlStickTop);
+    appendLayoutSlot ("PBEQ_LayoutStickBottom", savedLayoutXmlStickBottom);
+
+    // 脱离态模块独立存档（不隶属于任何布局槽）。
+    //   saveFloatingModulesAsXml() 始终返回合法的 <PBEQ_FloatingModules> 根节点
+    //   （无浮动模块时为空节点），因此这里一定会写出 —— 用于区分"新格式：无浮动模块"
+    //   与"旧格式：根本没有这份记录"。
+    appendLayoutSlot ("PBEQ_FloatingModules",   savedFloatingModulesXml);
+
+    // stick 会话
+    //   · active     只在驻留态写入（决定重启是否自动驻留）
+    //   · 方向 / 条高 无论当前是否驻留都写入 —— 用户调好的条高、上次驻留边
+    //     必须跨启动保留，否则「进 stick 调高 → 退出 stick → 关软件 → 重启」
+    //     会退回默认 250。
+    //   · restoreBounds 只在驻留态写入（= 进入 stick 前的普通窗口位置）
+    if (savedStickActive)
+        root.setProperty ("stickActive", true, nullptr);
+
+    if (savedStickBottom)
+        root.setProperty ("stickBottom", true, nullptr);
+
+    // 条高按侧独立保存（T/B 各一份，互不影响）
+    if (savedStickEditorHeightTop > 0)
+        root.setProperty ("stickEditorHTop", savedStickEditorHeightTop, nullptr);
+
+    if (savedStickEditorHeightBottom > 0)
+        root.setProperty ("stickEditorHBottom", savedStickEditorHeightBottom, nullptr);
+
+    if (savedStickActive)
+    {
+        const auto rb = getSavedStickRestoreBounds();
+        if (! rb.isEmpty())
+        {
+            root.setProperty ("stickRestoreX", rb.getX(),      nullptr);
+            root.setProperty ("stickRestoreY", rb.getY(),      nullptr);
+            root.setProperty ("stickRestoreW", rb.getWidth(),  nullptr);
+            root.setProperty ("stickRestoreH", rb.getHeight(), nullptr);
         }
     }
 
@@ -787,11 +838,99 @@ void Y2KmeterAudioProcessor::setStateInformation(const void* data, int sizeInByt
     if (root.hasProperty ("milkdropOffsetFoldY"))
         savedMilkdropVisualState_.offset.ivalue[2] = (int) root.getProperty ("milkdropOffsetFoldY", 0);
 
-    const auto layoutTree = root.getChildWithName("PBEQ_Layout");
-    if (layoutTree.isValid())
+    // 布局三槽。
+    //   读盘时把槽标签换回 PBEQ_Layout（ModuleWorkspace 只认该根类型）。
+    //   仅当文档确实带布局节点时才覆盖 —— 宿主可能传入不含布局的 partial state
+    //   （如某些 DAW 的 undo / 参数快照），此时必须保留内存里的现有布局。
+    auto readLayoutSlot = [&root] (const char* slotTag) -> juce::String
     {
-        if (auto layoutXml = layoutTree.createXml())
-            savedLayoutXml = layoutXml->toString(juce::XmlElement::TextFormat{}.singleLine());
+        auto tree = root.getChildWithName (juce::Identifier (slotTag));
+        if (! tree.isValid()) return {};
+
+        if (auto xml = tree.createXml())
+        {
+            xml->setTagName ("PBEQ_Layout");
+            return xml->toString (juce::XmlElement::TextFormat{}.singleLine());
+        }
+        return {};
+    };
+
+    const bool hasAnyLayoutSlot = root.getChildWithName ("PBEQ_Layout").isValid()
+                               || root.getChildWithName ("PBEQ_LayoutStickTop").isValid()
+                               || root.getChildWithName ("PBEQ_LayoutStickBottom").isValid();
+
+    if (hasAnyLayoutSlot)
+    {
+        savedLayoutXml            = readLayoutSlot ("PBEQ_Layout");
+        savedLayoutXmlStickTop    = readLayoutSlot ("PBEQ_LayoutStickTop");
+        savedLayoutXmlStickBottom = readLayoutSlot ("PBEQ_LayoutStickBottom");
+    }
+
+    // 脱离态模块独立存档。
+    //   · 新格式：直接读 <PBEQ_FloatingModules>；空节点同样是有效信息
+    //     （表示用户已经关闭了所有浮动模块，不能再从旧布局里"迁移"回来）。
+    //   · 旧格式：没有该节点 → 从 normal 槽的 <Module floating="true"> 迁移一次。
+    //     stick 槽里的旧浮动记录一律忽略 —— 那些记录正是"切换 stick 后已删除模块复活"的来源。
+    if (auto floatingTree = root.getChildWithName ("PBEQ_FloatingModules"); floatingTree.isValid())
+    {
+        if (auto xml = floatingTree.createXml())
+        {
+            xml->setTagName ("PBEQ_FloatingModules");
+            savedFloatingModulesXml = xml->toString (juce::XmlElement::TextFormat{}.singleLine());
+        }
+    }
+    else if (hasAnyLayoutSlot)
+    {
+        savedFloatingModulesXml.clear();
+
+        if (auto parsed = juce::parseXML (savedLayoutXml))
+        {
+            const auto layoutTree = juce::ValueTree::fromXml (*parsed);
+            juce::ValueTree floatingTree ("PBEQ_FloatingModules");
+
+            for (auto child : layoutTree)
+                if ((bool) child.getProperty ("floating", false))
+                    floatingTree.appendChild (child.createCopy(), nullptr);
+
+            if (auto xml = floatingTree.createXml())
+                savedFloatingModulesXml = xml->toString (juce::XmlElement::TextFormat{}.singleLine());
+        }
+    }
+
+    // stick 会话状态：只在文档显式带有该属性时更新（旧存档缺失 → 保持现状，
+    //   由导入路径的 syncStickSessionFlagToProcessor 校正为实际状态）
+    if (root.hasProperty ("stickActive"))
+        savedStickActive = (bool) root.getProperty ("stickActive", false);
+
+    if (root.hasProperty ("stickBottom"))
+        savedStickBottom = (bool) root.getProperty ("stickBottom", false);
+
+    if (root.hasProperty ("stickEditorHTop"))
+        savedStickEditorHeightTop = juce::jmax (0, (int) root.getProperty ("stickEditorHTop", 0));
+
+    if (root.hasProperty ("stickEditorHBottom"))
+        savedStickEditorHeightBottom = juce::jmax (0, (int) root.getProperty ("stickEditorHBottom", 0));
+
+    // 兼容早期存档：单值 stickEditorH → T/B 两侧共用
+    if (root.hasProperty ("stickEditorH"))
+    {
+        const int legacyH = juce::jmax (0, (int) root.getProperty ("stickEditorH", 0));
+
+        if (! root.hasProperty ("stickEditorHTop"))
+            savedStickEditorHeightTop = legacyH;
+
+        if (! root.hasProperty ("stickEditorHBottom"))
+            savedStickEditorHeightBottom = legacyH;
+    }
+
+    if (root.hasProperty ("stickRestoreW") && root.hasProperty ("stickRestoreH"))
+    {
+        setSavedStickRestoreBounds ({
+            (int) root.getProperty ("stickRestoreX", 0),
+            (int) root.getProperty ("stickRestoreY", 0),
+            (int) root.getProperty ("stickRestoreW", 0),
+            (int) root.getProperty ("stickRestoreH", 0)
+        });
     }
 }
 
@@ -804,6 +943,28 @@ juce::String Y2KmeterAudioProcessor::getSavedLayoutXml() const
 void Y2KmeterAudioProcessor::setSavedLayoutXml(const juce::String& xml)
 {
     savedLayoutXml = xml;
+}
+
+juce::String Y2KmeterAudioProcessor::getSavedLayoutXml (LayoutSlot slot) const
+{
+    switch (slot)
+    {
+        case LayoutSlot::stickTop:    return savedLayoutXmlStickTop;
+        case LayoutSlot::stickBottom: return savedLayoutXmlStickBottom;
+        case LayoutSlot::normal:
+        default:                      return savedLayoutXml;
+    }
+}
+
+void Y2KmeterAudioProcessor::setSavedLayoutXml (LayoutSlot slot, const juce::String& xml)
+{
+    switch (slot)
+    {
+        case LayoutSlot::stickTop:    savedLayoutXmlStickTop    = xml; break;
+        case LayoutSlot::stickBottom: savedLayoutXmlStickBottom = xml; break;
+        case LayoutSlot::normal:
+        default:                      savedLayoutXml            = xml; break;
+    }
 }
 
 // 插件入口

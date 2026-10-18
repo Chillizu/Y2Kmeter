@@ -3723,6 +3723,42 @@ Milkdrop 脱离态由 `GLView` 自己的本地 OpenGL 线程驱动渲染。切�
 
 ---
 
+## v2.8.6：Stick 三槽布局与浮动模块独立存档
+
+> 详细设计、存档格式、关键代码位置与测试清单见 [`docs/Stick_Floating_Module_v2.8.6.md`](docs/Stick_Floating_Module_v2.8.6.md)。
+
+本轮把"布局形态"与"脱离模块"彻底拆开，解决 Stick 与常驻布局互相覆盖、脱离模块在切换 Stick 时反复复活/丢失的问题。
+
+### 1. 布局三槽
+
+- `Y2KmeterAudioProcessor::LayoutSlot { normal, stickTop, stickBottom }`；
+- 所有写盘统一走 `persistCurrentLayoutToProcessor()`，按当前形态写对应槽；Stick 进入/退出/T↔B、预设切换、settings 导入导出、析构全部接入；
+- 存档新增 `<PBEQ_LayoutStickTop>` / `<PBEQ_LayoutStickBottom>`，旧 `<PBEQ_Layout>` 自动视为 normal；
+- Stick 会话（active/bottom/两侧条高/进入前窗口 bounds）一并持久化，重启后自动恢复条状驻留。
+
+### 2. 浮动模块独立存档
+
+- 三槽只保存 canvas 内模块；脱离模块写入独立的 `<PBEQ_FloatingModules>`（moduleId、类型、dock 回位 bounds、屏幕坐标、业务 state）；
+- `clearAllModules()` / 布局加载不再清空浮动记录，切换 Stick、切换 T/B 不影响浮动窗口；
+- 弹出、停靠、关闭浮动模块都会触发写盘；启动时先装载浮动记录，再在回调就绪后统一重建窗口；
+- 旧存档迁移：只从 normal 槽提取 floating 节点；旧 Stick 槽里的浮动记录刻意忽略（它们会导致已删除模块复活）。
+
+### 3. 驻留态弹出菜单
+
+- 根因是 JUCE `PopupMenu` 把菜单整体 clamp 到 `display->userArea`，而 AppBar 把条带从工作区挖掉；
+- 给本地 JUCE 增加 `PopupMenu::Options::withParentAreaOverride()`：Stick 态把允许区域放宽到整个显示器；
+- 预设下拉（`PinkXPStyle::getOptionsForComboBoxPopupMenu`）与右键"添加模块"菜单（`ModuleWorkspace::showAddMenu`）均已接入，菜单贴着控件/鼠标弹出；
+- 调用处用 `#if JUCE_WINDOWS` 包住，macOS 可用官方 JUCE 编译。
+
+### 4. 跨平台与构建
+
+- Stick / AppBar / 三槽映射全部在 Windows 条件编译内；mac 上 `activeLayoutSlot()` 恒 0；
+- UI 密度缩放：Windows 用 `Display::totalArea`（避免 AppBar 压缩 userArea 误判矮屏），mac 保持 `userArea`；
+- 版本 2.8.5 → **2.8.6**；安装包 `dist/Y2Kmeter_Setup_2.8.6_x64.exe`；
+- **踩坑**：只改版本号后增量构建不会重写 JUCE 生成的 `*_resources.rc`，需删除该文件再构建才能刷新 EXE/VST3 的版本信息。
+
+---
+
 ## v2.8.5：窗口行为模型重构（L / Hide / Stick 解耦）
 
 > 详细设计与测试清单见 [`docs/Window_Behavior_Model_v2.8.5.md`](docs/Window_Behavior_Model_v2.8.5.md)。

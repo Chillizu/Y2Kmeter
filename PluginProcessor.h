@@ -111,8 +111,62 @@ public:
 
     // ---- Phase E —— UI 布局持久化（Processor 作为唯一 state owner）----
     // 由 Editor 在 workspace->onLayoutChanged 里写回；Editor 启动时读取并装载。
-    juce::String getSavedLayoutXml() const;
-    void         setSavedLayoutXml(const juce::String& xml);
+    //
+    // v2.8.5：布局按"窗口形态"分三槽保存 —— 非 stick / stick 顶(T) / stick 底(B)。
+    //   · 三种形态各自保存互不覆盖：用户在 T/B 之间来回切换不会丢掉任何一侧
+    //     调好的布局；stick 期间改动也会落盘（重启后仍在）。
+    //   · 旧存档只有 <PBEQ_Layout>（= 非 stick 槽），读取时自动视为 normal。
+    enum class LayoutSlot { normal = 0, stickTop = 1, stickBottom = 2 };
+
+    juce::String getSavedLayoutXml() const;                     // = normal 槽（兼容旧调用）
+    void         setSavedLayoutXml (const juce::String& xml);   // = normal 槽
+    juce::String getSavedLayoutXml (LayoutSlot slot) const;
+    void         setSavedLayoutXml (LayoutSlot slot, const juce::String& xml);
+
+    // 脱离态模块独立存档（v2.8.5）：
+    //   · 与 normal / stickT / stickB 三个布局槽完全解耦，槽切换不会改动它；
+    //   · 记录 moduleId、类型、dock 回位 bounds、浮动窗口屏幕坐标、模块业务状态；
+    //   · 删除 / 停靠浮动模块后由下一次 persist 覆盖写回。
+    juce::String getSavedFloatingModulesXml() const { return savedFloatingModulesXml; }
+    void         setSavedFloatingModulesXml (const juce::String& xml) { savedFloatingModulesXml = xml; }
+
+    // ---- stick 会话持久化（Windows 专属语义；其它平台仅原样保存字段）----
+    //   active : 上次退出时是否处于 AppBar 驻留态 → 重启后自动恢复
+    //   bottom : 驻留边（false = 顶 T，true = 底 B）
+    bool isSavedStickActive() const noexcept { return savedStickActive; }
+    bool isSavedStickBottom() const noexcept { return savedStickBottom; }
+    void setSavedStickSession (bool active, bool bottom) noexcept
+    {
+        savedStickActive = active;
+        savedStickBottom = bottom;
+    }
+
+    // stick 驻留条的逻辑高度（Editor 高度），按 T/B 分别记录。
+    //   · 顶/底两侧的条高互不影响：在 T 侧拉高后切到 B，B 仍是它自己上次的高度。
+    int  getSavedStickEditorHeight (bool bottom) const noexcept
+    {
+        return bottom ? savedStickEditorHeightBottom : savedStickEditorHeightTop;
+    }
+    void setSavedStickEditorHeight (bool bottom, int h) noexcept
+    {
+        if (bottom)
+            savedStickEditorHeightBottom = juce::jmax (0, h);
+        else
+            savedStickEditorHeightTop    = juce::jmax (0, h);
+    }
+
+    // 进入 stick 前的"非 stick"窗口 bounds（退出 stick / 重启后再退出时还原）
+    juce::Rectangle<int> getSavedStickRestoreBounds() const noexcept
+    {
+        return { savedStickRestoreX, savedStickRestoreY, savedStickRestoreW, savedStickRestoreH };
+    }
+    void setSavedStickRestoreBounds (juce::Rectangle<int> r) noexcept
+    {
+        savedStickRestoreX = r.getX();
+        savedStickRestoreY = r.getY();
+        savedStickRestoreW = r.getWidth();
+        savedStickRestoreH = r.getHeight();
+    }
 
     // ---- 布局锁定态持久化（v1.8.3 新增）----
     //   · 抵锁后用户无法拖动/resize 窗口，模块 tile 、贴画也不能拖动/缩放；
@@ -213,7 +267,24 @@ private:
     std::atomic<bool> analysisActive { true };
 
     // Phase E —— 最近一次保存的布局（由 Editor 同步过来；序列化到 host 状态）
+    //   · savedLayoutXml            = 非 stick 槽（旧存档里的 <PBEQ_Layout>）
+    //   · savedLayoutXmlStickTop    = stick 顶(T) 槽
+    //   · savedLayoutXmlStickBottom = stick 底(B) 槽
     juce::String savedLayoutXml;
+    juce::String savedLayoutXmlStickTop;
+    juce::String savedLayoutXmlStickBottom;
+
+    // 脱离态模块独立存档（根节点 PBEQ_FloatingModules；不隶属于任何布局槽）
+    juce::String savedFloatingModulesXml;
+
+    // stick 会话状态（v2.8.5）：重启后据此自动恢复驻留态与方向
+    bool savedStickActive = false;
+    bool savedStickBottom = false;
+    // 驻留条逻辑高度（按侧独立；0 = 未保存，用默认布局高度）
+    int  savedStickEditorHeightTop    = 0;
+    int  savedStickEditorHeightBottom = 0;
+    int  savedStickRestoreX = 0, savedStickRestoreY = 0,
+         savedStickRestoreW = 0, savedStickRestoreH = 0;
 
     // 布局锁定态（v1.8.3）：true = 窗口/模块/贴画 均不可拖动/缩放。
     //   · Editor 里的锁定按钮切换时写到这里；

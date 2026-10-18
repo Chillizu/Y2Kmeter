@@ -357,16 +357,18 @@ public:
     void dockModule (ModulePanel& panel, juce::Rectangle<int> savedBounds);
 
     // 脱离态模块追踪数据结构：moduleId → (moduleType, 脱离前的 workspace 内 bounds)
-    // popOutModule 写入，dockModule 移除，saveLayoutTree 读取以持久化脱离状态
+    // 脱离态模块独立于布局槽（normal / stick Top / stick Bottom）管理：
+    //   · 不写进任何布局槽，切换 stick / 切换布局槽都不会重建或丢失它们；
+    //   · 单独存档（saveFloatingModulesTree），重启后按记录恢复浮动窗口。
     struct FloatingState {
       ModuleType type;
       juce::Rectangle<int> bounds;       // 脱离前 workspace 内坐标（dock 回位用）
-      juce::Rectangle<int> screenBounds; // 浮动窗口实际屏幕坐标（resize 时更新，持久化用）
+      juce::Rectangle<int> screenBounds; // 浮动窗口实际屏幕坐标（独立存档用）
       juce::ValueTree moduleState;       // 脱离态模块的业务状态（模式/参数/预设等）
     };
 
     // 获取当前处于脱离态的模块信息（moduleId → type+bounds）
-    // 供 saveLayoutTree 持久化使用
+    // 供 Editor 在运行期重建 / 同步浮动窗口使用。
     std::map<juce::String, juce::Rectangle<int>> getFloatingModuleStates() const noexcept {
         std::map<juce::String, juce::Rectangle<int>> result;
         for (const auto& [id, state] : floatingModuleStates_)
@@ -375,10 +377,7 @@ public:
     }
     const std::map<juce::String, FloatingState>& getFloatingModuleStatesRaw() const noexcept { return floatingModuleStates_; }
 
-    // 覆盖式写回脱离态记录（保留浮动模块用）。
-    //   场景：stick 临时布局调用 clearAllModules() 会清空脱离态记录，
-    //   而浮动窗口本身仍在 —— 切换完成后把快照写回，避免浮动模块被"遗忘"
-    //   （否则下一次 saveLayoutTree 不再包含它们）。
+    // 覆盖式写回脱离态记录（供导出 / 导入存档时整体替换使用）。
     void restoreFloatingModuleStates (const std::map<juce::String, FloatingState>& states) noexcept
     {
         floatingModuleStates_ = states;
@@ -398,7 +397,7 @@ public:
     }
 
     // 更新脱离态模块的浮动窗口屏幕位置，供 FloatingModuleWindow::handleAsyncUpdate 调用
-    // 确保 saveLayoutTree 写入的是用户调整后的实际窗口位置，而非脱离时刻的旧坐标
+    // 保证运行期记录的是用户调整后的实际窗口位置，而非脱离时刻的旧坐标
     void updateFloatingStateScreenBounds(const juce::String& id, juce::Rectangle<int> screenBounds)
     {
         auto it = floatingModuleStates_.find(id);
@@ -441,12 +440,30 @@ public:
     // ======================================================
 
     // 保存 / 加载布局到 ValueTree
+    // 布局（各槽）只包含 canvas 内的模块；脱离态模块不写进任何槽。
+    //   · 槽位切换（含 stick T/B）因此不会重建 / 丢失浮动模块；
+    //   · 脱离态模块由下面的 saveFloatingModulesTree 单独存档。
     juce::ValueTree saveLayoutTree() const;
-    bool            loadLayoutFromTree(const juce::ValueTree& tree);
+
+    // importLegacyFloating：仅用于导入旧版"裸布局文件"（PBEQ_Layout 里还带着
+    //   floating 节点）。正常槽位加载应传 false —— 浮动记录由独立存档维护，
+    //   不能跟着布局槽走，否则会复活已删除的模块。
+    bool            loadLayoutFromTree(const juce::ValueTree& tree,
+                                       bool importLegacyFloating = false);
 
     // XML 便捷接口（用于 Processor::getStateInformation）
     juce::String saveLayoutAsXml() const;
-    bool         loadLayoutFromXml(const juce::String& xmlString);
+    bool         loadLayoutFromXml(const juce::String& xmlString,
+                                   bool importLegacyFloating = false);
+
+    // 脱离态模块独立存档：与布局槽解耦，任何槽的保存/加载都不碰这份记录。
+    //   · 根节点 PBEQ_FloatingModules，子节点复用 <Module floating="true" ...>；
+    //   · 删除 / 停靠浮动模块后会被下一次 persist 同步（removeFloatingState 会
+    //     触发 onLayoutChanged）。
+    juce::ValueTree saveFloatingModulesTree() const;
+    juce::String    saveFloatingModulesAsXml() const;
+    void            loadFloatingModulesFromTree (const juce::ValueTree& tree);
+    void            loadFloatingModulesFromXml (const juce::String& xmlString);
 
     // 用户操作布局（添加/删除/移动/缩放）后回调，由 Editor 订阅 → 写回 Processor
     std::function<void()> onLayoutChanged;
@@ -548,8 +565,16 @@ public:
 
     // stick 模式状态（Windows 专属）：切换底部 toolbar 的 stick 按钮组显示。
     //   · 未激活：显示 "STICK" 按钮；激活：显示 "X"（退出）+ "T/B"（顶/底切换）。
-    //   · 由 Editor 在 enterStickMode / exitStickMode 里调用。
-    void setStickActive (bool active);
+    //   · bottomAligned：当前驻留边（false=顶 T / true=底 B）——决定预设下拉里
+    //     只显示哪一项横向条。
+    //   · 由 Editor 在 enter / exit / T↔B 切换 / 启动恢复里调用。
+    void setStickActive (bool active, bool bottomAligned = false);
+
+    // stick 按钮组是否出现在工具栏（默认 true）。
+    //   · 插件宿主模式（VST3 / AU）必须设为 false：stick 依赖 SHAppBarMessage 把
+    //     顶层窗口注册成 AppBar，在 DAW 里注册的会是宿主窗口（等于劫持宿主），
+    //     而且窗口几何完全归宿主管理，无法保证条状驻留。
+    void setStickUiVisible (bool shouldBeVisible);
 
     // 控制"布局预设 Save / Load"两个按钮的独立可见性（与布局预设下拉互相解耦）。
     //   · 用于 VST3 / AU 等插件模式：DAW 里我们仍然要让用户能 Save/Load 预设文件
@@ -763,7 +788,7 @@ private:
     bool popOutEnabled_ = true;
 
     // 脱离态模块追踪：moduleId → (moduleType, 脱离前的 workspace 内 bounds)
-    // popOutModule 写入，dockModule 移除，saveLayoutTree 读取以持久化脱离状态
+    // 仅运行期使用：popOutModule 写入，dockModule 移除；不参与布局存档。
     std::map<juce::String, FloatingState> floatingModuleStates_;
 
     // 底部工具栏里的主题选择器（XP 画图调色板样式）
@@ -930,6 +955,11 @@ private:
     // Grid 与 layoutPresetBox 之间的竖直分割线 x 坐标（-1 = chrome 隐藏态未布局）
     int              toolbarDividerXLayout = -1;
 
+    // 重建预设下拉条目：
+    //   · 普通态 = 全部预设
+    //   · stick 驻留态 = 仅当前这一侧的一项（HORIZONTAL BAR(T) / (B)），作为形态指示
+    void rebuildLayoutPresetItems();
+
     // 预设 Save/Load 按钮（紧邻 layoutPresetBox 左侧）
     //   · Save：用户把当前 settings 文件另存为到指定位置（自定义文件名，后缀 .settings）
     //   · Load：用户选择一个之前 Save 过的 .settings 文件覆盖当前 settings，然后
@@ -946,7 +976,9 @@ private:
     juce::TextButton stickBtn;
     juce::TextButton stickExitBtn;
     juce::TextButton stickToggleBtn;
-    bool             stickActive = false;
+    bool             stickActive        = false;
+    bool             stickBottomAligned = false;  // true = 底(B) / false = 顶(T)
+    bool             stickUiVisible     = true;   // false = 插件宿主模式，整组不显示也不占位
 
     // 添加模块菜单（双击 / 右键空白区）hover 预览状态
     //   · 当用户在 PopupMenu 里悬停在某一模块名上时，在 canvas 的 hoverPreviewPos

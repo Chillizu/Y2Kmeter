@@ -200,6 +200,20 @@ juce::Rectangle<int> resolveDisplayArea (const juce::Rectangle<int>& realArea)
 
     return juce::Rectangle<int> (0, 0, w, h);
 }
+
+// UI 密度缩放的判据区域（跨平台差异）：
+//   · Windows：必须用 totalArea —— AppBar/stick 驻留会真实压缩 userArea，
+//     条高拉大时若用 userArea 会把"屏幕变矮了"的假象喂给分级表；
+//   · macOS：保持 userArea —— 菜单栏 / Dock 减少的是真实可用空间，
+//     且 mac 没有 stick/AppBar，用 totalArea 会改变部分机型的缩放档位。
+juce::Rectangle<int> resolveUiScaleArea (const juce::Displays::Display& display) noexcept
+{
+   #if JUCE_WINDOWS
+    return display.totalArea;
+   #else
+    return display.userArea;
+   #endif
+}
 }  // namespace
 
 // ==========================================================
@@ -325,16 +339,23 @@ void Y2KmeterAudioProcessorEditor::syncFloatingWindowStatesToWorkspace()
     }
 }
 
+void Y2KmeterAudioProcessorEditor::reloadFloatingModuleRecordsFromProcessor()
+{
+    if (workspace == nullptr) return;
+    workspace->loadFloatingModulesFromXml (processor.getSavedFloatingModulesXml());
+}
+
 // 由 workspace 的脱离态记录重建浮动窗口。
-//   · 用于"从存档恢复"以及"退出 stick 后还原备份布局"；
-//   · 调用前必须确保 floatingWindows_ 为空（否则会重复实例化）。
+//   · 用于启动恢复、退出 stick、导入 settings 后补齐窗口；
+//   · 已存在同 moduleId 的窗口会跳过（不会重复实例化）；
+//   · 先把"存活但不在记录里"的窗口补登记回去，保证记录与真实窗口一致。
 void Y2KmeterAudioProcessorEditor::restoreFloatingWindowsFromWorkspace()
 {
     if (isPluginHost || workspace == nullptr)
         return;
 
     // 先补登记"存活但不在记录里"的浮动窗口（stick 期间新脱离的模块不在备份里），
-    // 否则它们会从下一次 saveLayoutTree 里悄悄消失。
+    // 否则运行期的 dock 回位信息会缺失。
     for (auto& wnd : floatingWindows_)
     {
         if (wnd == nullptr) continue;
@@ -451,7 +472,7 @@ public:
         const juce::Font versionFont = PinkXP::getFont (10.0f, juce::Font::italic);
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
         const int nameW    = nameFont.getStringWidth ("Y2Kmeter");
-const int versionW = versionFont.getStringWidth ("v2.8.5");
+        const int versionW = versionFont.getStringWidth ("v2.8.6");
         const int urlW     = urlFont.getStringWidth ("iisaacbeats.cn");
         constexpr int gap1 = 6;
         constexpr int gap2 = 10;
@@ -492,7 +513,7 @@ const int versionW = versionFont.getStringWidth ("v2.8.5");
     {
         // ------- 1) 顶部抬头文字：软件名 + 版本号 + 官网（低对比度，贴在底图上）-------
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.8.5";
+        const juce::String versionText = "v2.8.6";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont(12.0f, juce::Font::plain);
@@ -1054,12 +1075,21 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
 
     initLookAndFeel();
 
-    // 0.5) 低分辨率适配：先按主显示器 userArea 预估 UI 密度缩放，让紧接着的
+#if JUCE_WINDOWS
+    // v2.8.5：读取上次退出时的 stick 会话（仅 Standalone）。
+    //   此处只记录标志；真正 AppBar 驻留要等窗口上屏有 HWND 之后
+    //   （timerCallback → restoreSavedStickSession）。
+    pendingStickRestore = ! isPluginHost && processor.isSavedStickActive();
+    pendingStickBottom  = pendingStickRestore && processor.isSavedStickBottom();
+#endif
+
+    // 0.5) 低分辨率适配：先按主显示器预估 UI 密度缩放（Windows 用 totalArea /
+    //   mac 用 userArea，见 resolveUiScaleArea），让紧接着的
     //   setSize()/loadInitialModules() 就用上正确的缩放 chrome 布局。
     //   （此时 Editor 尚未挂到顶层窗口，无法确定最终所在显示器，故用主显示器
     //    先给一个合理初值；visibilityChanged 会按实际窗口所在显示器再校准一次。）
     if (auto* primary = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-        PinkXP::setUiScale (PinkXP::uiScaleForDisplay (primary->userArea));
+        PinkXP::setUiScale (PinkXP::uiScaleForDisplay (resolveUiScaleArea (*primary)));
 
     // 1) 先创建 ChromeHiddenOverlay 并以 invisible 状态加入 —— 让它成为"最底层"子组件
     //    （后续 workspace / 其它组件 addAndMakeVisible 时都会排到它之上）。
@@ -1114,6 +1144,13 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
         // Milkdrop WebGL 可视化模块（WebView 嵌入 Butterchurn 引擎）
         ModuleType::milkdrop
     });
+
+#if JUCE_WINDOWS
+    // 插件宿主模式屏蔽 stick 按钮：SHAppBarMessage 会把「宿主顶层窗口」注册成
+    //   AppBar 并压缩桌面工作区（等于劫持宿主），且窗口几何完全归宿主管理，
+    //   无法保证条状驻留。该功能只在 Standalone 暴露。
+    workspace->setStickUiVisible (! isPluginHost);
+#endif
 
     addAndMakeVisible(*workspace);
 
@@ -1186,10 +1223,11 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
     loadInitialModules();
 #endif
 
-    // 4) 用户布局变更 → 立即写回 Processor state
+    // 4) 用户布局变更 → 立即写回 Processor state 的"当前活动槽"
+    //    （v2.8.5：stick 期间写 stick 槽，绝不污染非 stick 布局）
     workspace->onLayoutChanged = [this]()
     {
-        processor.setSavedLayoutXml(workspace->saveLayoutAsXml());
+        persistCurrentLayoutToProcessor();
     };
 
     // 4.0) 模块弹出请求 → 创建浮动窗口（仅 Standalone 模式）
@@ -1362,9 +1400,9 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
             syncFloatingWindowStatesToWorkspace();
             workspace->flushPendingLayoutChange();
             // flushPendingLayoutChange 内部若有待决通知会同步回调
-            // onLayoutChanged → setSavedLayoutXml；若无待决，这里兜底
+            // onLayoutChanged → 写回当前槽；若无待决，这里兜底
             // 再写一次也廉价（仅字符串赋值），保证一致性。
-            processor.setSavedLayoutXml (workspace->saveLayoutAsXml());
+            persistCurrentLayoutToProcessor();
         }
     };
 
@@ -1381,11 +1419,13 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
     workspace->onLayoutPresetChanged = [this](ModuleWorkspace::LayoutPreset preset)
     {
         // ★ Bug4修复：切换布局预设前，强制归位所有脱离态模块
-        //   否则新旧布局混杂，切换后的模块与残留浮动窗口并存
-        if (workspace != nullptr && !floatingWindows_.empty())
+        //   否则新旧布局混杂，切换后的模块与残留浮动窗口并存。
+        //   v2.8.5：stick 驻留态例外 —— 重置的是"条状槽布局"，用户脱离出去的
+        //   模块应当继续以浮动窗口存在，不能被 dock 回来再被 clearAllModules 删掉。
+        if (workspace != nullptr && !floatingWindows_.empty() && ! stickActive)
         {
-            // 先保存当前布局（包含浮动模块的干净布局）
-            processor.setSavedLayoutXml(workspace->saveLayoutAsXml());
+            // 先保存当前布局（包含浮动模块的干净布局，写入当前活动槽）
+            persistCurrentLayoutToProcessor();
 
             for (auto& wnd : floatingWindows_)
             {
@@ -1779,9 +1819,11 @@ Y2KmeterAudioProcessorEditor::~Y2KmeterAudioProcessorEditor()
     if (workspace != nullptr)
     {
         // 先同步所有浮动窗口真实屏幕 bounds，再保存脱离态布局。
+        //   v2.8.5：按当前活动槽写回 —— 若退出时仍处于 stick 态，这里写的是
+        //   stick 槽，非 stick 布局保持原样（下次启动恢复 stick 后点 X 能回去）。
         syncFloatingWindowStatesToWorkspace();
         workspace->flushPendingLayoutChange();
-        processor.setSavedLayoutXml(workspace->saveLayoutAsXml());
+        persistCurrentLayoutToProcessor();
         // 清零回调，后续 dock 操作不再触发保存
         workspace->onLayoutChanged = nullptr;
     }
@@ -1926,21 +1968,60 @@ void Y2KmeterAudioProcessorEditor::initWorkspace()
 void Y2KmeterAudioProcessorEditor::loadInitialModules()
 {
     // 1) 优先恢复已保存布局
-    const auto savedXml = processor.getSavedLayoutXml();
-    if (savedXml.isNotEmpty() && workspace->loadLayoutFromXml(savedXml))
-        return;
+    //    v2.8.5：若上次退出时处于 stick 驻留态，装载对应的一侧槽（T/B），
+    //    让窗口上屏时显示的就是用户上次看到的条状布局；AppBar 驻留本身
+    //    要等 HWND 就绪，由 timerCallback → restoreSavedStickSession() 补做。
+    juce::String savedXml;
+#if JUCE_WINDOWS
+    if (pendingStickRestore)
+    {
+        savedXml = processor.getSavedLayoutXml (
+            pendingStickBottom ? Y2KmeterAudioProcessor::LayoutSlot::stickBottom
+                               : Y2KmeterAudioProcessor::LayoutSlot::stickTop);
 
-    // 2) 首次打开（无已保存布局）的默认预设：
-    //    · Standalone 模式：Horizontal Bar(T)——保留老用户习惯（横向铺满屏幕顶部）；
-    //    · 插件模式（VST3 / AU 等）：Default 预设——宿主 DAW 的子窗口不适合让
-    //      Y2Kmeter 主动去改顶层窗口尺寸/位置（horizontalFull 会尝试把窗口拉到
-    //      屏幕宽度并移到屏幕左上，和宿主嵌入布局冲突），因此首次使用"默认瀑布
-    //      布局 + 默认 960×640 窗口"更安全、体验更一致。
-    //    注意：仅变更首次默认入口，不影响预设列表里的 Default / Horizontal Bar 选项。
-    const auto firstRunPreset = isPluginHost
-                                    ? ModuleWorkspace::LayoutPreset::defaultGrid
-                                    : ModuleWorkspace::LayoutPreset::horizontalFull;
-    applyLayoutPreset ((int) firstRunPreset);
+        if (savedXml.isEmpty())
+        {
+            // stick 槽缺失（存档不完整）：放弃本次自动驻留，退回普通布局。
+            //   否则布局槽映射会把普通布局写进 stick 槽，还会 dock 一个不匹配
+            //   的条状窗口。
+            pendingStickRestore = false;
+            processor.setSavedStickSession (false, pendingStickBottom);
+            savedXml = processor.getSavedLayoutXml (Y2KmeterAudioProcessor::LayoutSlot::normal);
+        }
+    }
+    else
+#endif
+    {
+        savedXml = processor.getSavedLayoutXml();
+    }
+
+    // 1.5) 先恢复脱离态模块记录（独立存档，不隶属于任何布局槽）。
+    //   必须在 applyLayoutPreset / 任何 persist 之前装载：否则启动阶段写盘会把
+    //   Processor 里已有的浮动记录覆盖成空。
+    //   这里只填充 workspace 的记录，不创建窗口 —— 创建窗口依赖
+    //   onModulePopOutRequested，此时 callback 还没接上。
+    workspace->loadFloatingModulesFromXml (processor.getSavedFloatingModulesXml());
+
+    bool layoutLoaded = false;
+    if (savedXml.isNotEmpty())
+        layoutLoaded = workspace->loadLayoutFromXml(savedXml);
+
+    if (! layoutLoaded)
+    {
+        // 2) 首次打开（无已保存布局）的默认预设：
+        //    · Standalone 模式：Horizontal Bar(T)——保留老用户习惯（横向铺满屏幕顶部）；
+        //    · 插件模式（VST3 / AU 等）：Default 预设——宿主 DAW 的子窗口不适合让
+        //      Y2Kmeter 主动去改顶层窗口尺寸/位置（horizontalFull 会尝试把窗口拉到
+        //      屏幕宽度并移到屏幕左上，和宿主嵌入布局冲突），因此首次使用"默认瀑布
+        //      布局 + 默认 960×640 窗口"更安全、体验更一致。
+        //    注意：仅变更首次默认入口，不影响预设列表里的 Default / Horizontal Bar 选项。
+        const auto firstRunPreset = isPluginHost
+                                        ? ModuleWorkspace::LayoutPreset::defaultGrid
+                                        : ModuleWorkspace::LayoutPreset::horizontalFull;
+        applyLayoutPreset ((int) firstRunPreset);
+    }
+    // 浮动窗口由构造流程后半段的 restoreFloatingWindowsFromWorkspace() 统一创建
+    //   （那时 onModulePopOutRequested 已就绪）。
 }
 
 // ----------------------------------------------------------
@@ -2239,12 +2320,9 @@ void Y2KmeterAudioProcessorEditor::applyLayoutPreset (int presetId)
                 virtuPetStates.add ({ t->getRoleName(), t->getHunger(), t->getHealth() });
     }
 
-    // stick 临时布局（Horizontal Bar）：浮动模块继续保持浮动，不参与本次重建。
-    //   clearAllModules 会清空脱离态记录 → 先快照，重建完再写回，否则浮动模块会
-    //   从 layout 树里消失（下一次保存就不再包含它们）。
-    std::map<juce::String, ModuleWorkspace::FloatingState> preservedFloatingStates;
-    if (stickActive)
-        preservedFloatingStates = workspace->getFloatingModuleStatesRaw();
+    // 说明：浮动模块不参与本次重建，也不会被 clearAllModules 清掉 ——
+    //   脱离态记录与布局槽完全解耦（见 ModuleWorkspace::saveFloatingModulesTree）。
+    //   非 stick 预设切换时，Editor 会先把浮动窗口 dock 回 canvas（既有行为）。
 
     // 先清空现有模块 / 拼豆贴画（clearAllModules 不触发 onLayoutChanged）
     workspace->clearAllModules();
@@ -2298,6 +2376,7 @@ void Y2KmeterAudioProcessorEditor::applyLayoutPreset (int presetId)
         //     2) overheadH = targetH - canvas.getHeight()（Editor 里非 canvas 的部分）
         //     3) 调整 targetH 使 (targetH - overheadH) 是 8 的倍数，并尽量靠近 250
         // ------------------------------------------------------------
+        // 重置预设 = 布局与条高一起回到默认 250（stick 态下用户点下拉的语义）。
         constexpr int kHorizontalStripHeight = 250;
         int targetH = kHorizontalStripHeight;
 
@@ -2785,13 +2864,17 @@ void Y2KmeterAudioProcessorEditor::applyLayoutPreset (int presetId)
         workspace->addModule (std::move (virtuPet), false);
     }
 
-    // stick：把浮动模块的脱离态记录写回（浮动窗口仍在，不能让它们从布局里消失）
-    if (stickActive && ! preservedFloatingStates.empty())
-        workspace->restoreFloatingModuleStates (preservedFloatingStates);
-
     // 手动回写布局到 Processor（clearAllModules + 批量 addModule 会触发多次
     // onLayoutChanged，我们在这里统一再写一次确保最终态被持久化）
-    processor.setSavedLayoutXml (workspace->saveLayoutAsXml());
+    //   · v2.8.5：写入当前活动槽（stick 期间 = 对应的 T/B 槽）
+    persistCurrentLayoutToProcessor();
+
+#if JUCE_WINDOWS
+    // stick 态重置布局后：条高/窗口位置可能被预设流程调整过，立即把 AppBar
+    //   占位与窗口重新对齐，避免工作区出现空档。
+    if (stickActive)
+        redockStickAfterGeometryChange();
+#endif
 
     // ------------------------------------------------------------------
     // 修复：切换预设（特别是预设 2）后顶层窗口的 alwaysOnTop 会"显示按下但
@@ -3040,7 +3123,7 @@ void Y2KmeterAudioProcessorEditor::saveStateAsSettingsFile (const juce::File& de
     //    拿到的是用户眼睛看到的最新状态（onLayoutChanged 是异步节流的，不能指望
     //    点击 Save 的那一瞬间刚好已经被刷到 Processor）
     if (workspace != nullptr)
-        processor.setSavedLayoutXml (workspace->saveLayoutAsXml());
+        persistCurrentLayoutToProcessor();
 
     // 2) 导出 Processor state（内部是 XML 的二进制化形式）
     juce::MemoryBlock stateBlock;
@@ -3104,15 +3187,29 @@ void Y2KmeterAudioProcessorEditor::loadStateFromSettingsFile (const juce::File& 
             juce::MemoryBlock block;
             if (block.fromBase64Encoding (b64) && block.getSize() > 0)
             {
-                // 反序列化回 Processor —— 内部会更新 savedLayoutXml
+                // 反序列化回 Processor —— 内部会更新三槽布局
                 processor.setStateInformation (block.getData(), (int) block.getSize());
                 // 立刻把新布局灌到 workspace（不用等宿主再开关一次 Editor）
+                //   v2.8.5：装载"当前活动槽"（stick 态装载对应一侧，否则非 stick 槽）
                 if (workspace != nullptr)
                 {
-                    const auto layoutXml = processor.getSavedLayoutXml();
+                    auto layoutXml = processor.getSavedLayoutXml (
+                        static_cast<Y2KmeterAudioProcessor::LayoutSlot> (activeLayoutSlot()));
+
+                    if (layoutXml.isEmpty())
+                        layoutXml = processor.getSavedLayoutXml (Y2KmeterAudioProcessor::LayoutSlot::normal);
+
                     if (layoutXml.isNotEmpty())
                         workspace->loadLayoutFromXml (layoutXml);
                 }
+
+                // 脱离态模块是独立存档：导入后重新装载记录并补齐浮动窗口
+                reloadFloatingModuleRecordsFromProcessor();
+                restoreFloatingWindowsFromWorkspace();
+
+                // v2.8.5：存档里的 stickActive 描述的是导出方当时的状态，
+                //   按本机会话的实际情况校正，避免下次启动莫名进入 stick。
+                syncStickSessionFlagToProcessor();
                 return;
             }
         }
@@ -3130,10 +3227,21 @@ void Y2KmeterAudioProcessorEditor::loadStateFromSettingsFile (const juce::File& 
             processor.setStateInformation (block.getData(), (int) block.getSize());
             if (workspace != nullptr)
             {
-                const auto layoutXml = processor.getSavedLayoutXml();
+                auto layoutXml = processor.getSavedLayoutXml (
+                    static_cast<Y2KmeterAudioProcessor::LayoutSlot> (activeLayoutSlot()));
+
+                if (layoutXml.isEmpty())
+                    layoutXml = processor.getSavedLayoutXml (Y2KmeterAudioProcessor::LayoutSlot::normal);
+
                 if (layoutXml.isNotEmpty())
                     workspace->loadLayoutFromXml (layoutXml);
             }
+
+            reloadFloatingModuleRecordsFromProcessor();
+            restoreFloatingWindowsFromWorkspace();
+
+            // v2.8.5：同分支 a，按本机会话实际情况校正 stick 标记
+            syncStickSessionFlagToProcessor();
             return;
         }
     }
@@ -3142,10 +3250,15 @@ void Y2KmeterAudioProcessorEditor::loadStateFromSettingsFile (const juce::File& 
     if (xml->hasTagName ("PBEQ_Layout"))
     {
         const auto layoutXml = xml->toString (juce::XmlElement::TextFormat{}.singleLine());
-        // 同步写回 Processor 以便下次 getStateInformation 能拿到
-        processor.setSavedLayoutXml (layoutXml);
+        // 同步写回 Processor 的当前活动槽，以便下次 getStateInformation 能拿到
+        processor.setSavedLayoutXml (
+            static_cast<Y2KmeterAudioProcessor::LayoutSlot> (activeLayoutSlot()), layoutXml);
         if (workspace != nullptr)
-            workspace->loadLayoutFromXml (layoutXml);
+        {
+            // 旧版布局文件里可能仍带 floating 节点 → 迁移成独立浮动记录
+            workspace->loadLayoutFromXml (layoutXml, true);
+            restoreFloatingWindowsFromWorkspace();
+        }
         return;
     }
 
@@ -3290,7 +3403,7 @@ void Y2KmeterAudioProcessorEditor::drawTitleBar (juce::Graphics& g)
 
         // 主标题 "Y2Kmeter"
         const juce::String nameText    = "Y2Kmeter";
-const juce::String versionText = "v2.8.5";
+        const juce::String versionText = "v2.8.6";
         const juce::String urlText     = "iisaacbeats.cn";
 
         const juce::Font nameFont    = PinkXP::getFont (12.0f, juce::Font::bold);
@@ -3298,7 +3411,7 @@ const juce::String versionText = "v2.8.5";
         const juce::Font urlFont     = PinkXP::getFont (10.0f, juce::Font::plain);
 
         const int nameW    = nameFont.getStringWidth (nameText);
-        const int versionW = versionFont.getStringWidth ("v2.8.5");
+                const int versionW = versionFont.getStringWidth ("v2.8.6");
         const int urlW     = urlFont.getStringWidth (urlText);
 
         constexpr int gap1 = 6;   // name ↔ version 之间
@@ -3624,10 +3737,15 @@ juce::Rectangle<int> Y2KmeterAudioProcessorEditor::getFloatingCloseButtonBounds(
 // UI 密度缩放（低分辨率适配）
 //   根据顶层窗口所在显示器的逻辑分辨率计算缩放因子并写入 PinkXP 全局。
 //   只在缩放因子真正变化时触发一次 resized() + repaint()，避免频繁重排。
+//
+//   判据区域由 resolveUiScaleArea() 决定：
+//     · Windows 用 totalArea —— userArea 会被任务栏和**我们自己的 AppBar 驻留**
+//       压缩，stick 条拉高时会误判为矮屏；
+//     · macOS 用 userArea —— 菜单栏 / Dock 是真实可用空间，且没有 stick/AppBar。
 // ==========================================================
 void Y2KmeterAudioProcessorEditor::updateUiScaleForCurrentDisplay()
 {
-    juce::Rectangle<int> userArea;
+    juce::Rectangle<int> displayArea;
 
     if (auto* top = getTopLevelComponent())
     {
@@ -3636,17 +3754,17 @@ void Y2KmeterAudioProcessorEditor::updateUiScaleForCurrentDisplay()
                                  .getDisplays()
                                  .getDisplayForRect (sb))
         {
-            userArea = display->userArea;
+            displayArea = resolveUiScaleArea (*display);
         }
     }
 
-    if (userArea.isEmpty())
+    if (displayArea.isEmpty())
     {
         if (auto* primary = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-            userArea = primary->userArea;
+            displayArea = resolveUiScaleArea (*primary);
     }
 
-    const float target = PinkXP::uiScaleForDisplay (userArea);
+    const float target = PinkXP::uiScaleForDisplay (displayArea);
     if (std::abs (target - PinkXP::uiScale()) < 0.001f)
         return;
 
@@ -3727,6 +3845,73 @@ void Y2KmeterAudioProcessorEditor::handleMinimiseClicked()
     }
 }
 
+// ==========================================================
+// 布局三槽（v2.8.5）
+// ----------------------------------------------------------
+//   stick 模式下窗口形状完全不同（屏幕宽 × 条高），模块布局与常驻态不兼容，
+//   因此按"当前形态"分槽保存：
+//       0 = 非 stick（常驻窗口）
+//       1 = stick 顶(T)
+//       2 = stick 底(B)
+//   保存时只写当前槽：切 T/B 只换槽，另一侧调好的布局不会被覆盖。
+// ==========================================================
+int Y2KmeterAudioProcessorEditor::activeLayoutSlot() const noexcept
+{
+#if JUCE_WINDOWS
+    if (stickActive)
+        return stickBottomAligned ? 2 : 1;
+
+    // 启动恢复窗口期：loadInitialModules 已按 stick 槽装载布局，但 AppBar 驻留
+    //   要等窗口上屏（timerCallback → restoreSavedStickSession）。这段时间里
+    //   任何 onLayoutChanged / persist 仍必须写 stick 槽 —— 否则会把条状布局
+    //   覆盖进非 stick 槽，导致「退出 stick 后无法还原原布局」。
+    if (pendingStickRestore)
+        return pendingStickBottom ? 2 : 1;
+#endif
+    return 0;
+}
+
+void Y2KmeterAudioProcessorEditor::persistCurrentLayoutToProcessor()
+{
+    if (workspace == nullptr) return;
+
+#if JUCE_WINDOWS
+    // 启动恢复窗口期：窗口还是普通窗口尺寸，模块可能已被 resized() 夹紧，
+    //   此时布局只是过渡态 —— 一律不写回任何槽（否则会把过渡态固化：
+    //   旧 bug 正是把条状布局写进非 stick 槽，或把夹紧后的条状布局写回 stick 槽）。
+    if (pendingStickRestore)
+        return;
+#endif
+
+    // 保存前同步浮动窗口的真实屏幕位置 / 模块状态
+    syncFloatingWindowStatesToWorkspace();
+
+    // 1) 当前布局槽：只存 canvas 内模块（不含浮动模块）
+    processor.setSavedLayoutXml (
+        static_cast<Y2KmeterAudioProcessor::LayoutSlot> (activeLayoutSlot()),
+        workspace->saveLayoutAsXml());
+
+    // 2) 脱离态模块独立存档：与布局槽解耦，切换 stick / T-B 不会改动它。
+    processor.setSavedFloatingModulesXml (workspace->saveFloatingModulesAsXml());
+
+#if JUCE_WINDOWS
+    // stick 驻留条高度随布局一起存档（按当前侧）：退出 stick / 重启后按该侧高度恢复。
+    //   仅当窗口确实完成过驻留（stickDockedHeightPx>0）时才记录：启动恢复期间
+    //   窗口还处在普通/条状过渡尺寸，此时记录会覆盖存档里的真实条高。
+    if (stickActive && stickDockedHeightPx > 0)
+        processor.setSavedStickEditorHeight (stickBottomAligned, stickEditorHeightForSave());
+#endif
+}
+
+void Y2KmeterAudioProcessorEditor::syncStickSessionFlagToProcessor()
+{
+#if JUCE_WINDOWS
+    processor.setSavedStickSession (stickActive, stickBottomAligned);
+#else
+    processor.setSavedStickSession (false, false);
+#endif
+}
+
 #if JUCE_WINDOWS
 // ==========================================================
 // stick 模式（Windows 专属：AppBar 硬 stick 驻留）
@@ -3767,6 +3952,52 @@ void Y2KmeterAudioProcessorEditor::setStickOnscreenRelaxed (bool relaxed)
     }
 }
 
+int Y2KmeterAudioProcessorEditor::stickEditorHeightForSave() const noexcept
+{
+    int h = getHeight();
+
+    // hide 态下 chrome 收起，Editor 高度比 show 态少 62px（titleBar+toolbar）；
+    //   存档统一按 show 态等效高度，恢复时（先展开再设高度）才不会逐次缩水。
+    if (workspace != nullptr && ! workspace->isChromeVisible())
+        h += getChromeHeightPx();
+
+    return juce::jmax (1, h);
+}
+
+void Y2KmeterAudioProcessorEditor::applyStickBarGeometry (bool bottom, int targetEditorHeight)
+{
+    auto* top = getTopLevelComponent();
+    if (top == nullptr) top = this;
+
+    // Standalone 下顶层窗口比 Editor 多出上下边框（各 4px）；按"当前窗口 - 当前
+    //   Editor"实测差值补偿，避免直接用 Editor 高度设窗口导致每次恢复缩水 8px。
+    int frameH = 0;
+    if (top != this)
+        frameH = juce::jmax (0, top->getHeight() - getHeight());
+
+    const auto display = juce::Desktop::getInstance().getDisplays()
+                             .getDisplayForPoint (top->getScreenBounds().getCentre());
+    const auto userArea = resolveDisplayArea ((display != nullptr) ? display->userArea
+                                                                  : juce::Rectangle<int> (1280, 720));
+
+    const int w       = userArea.getWidth();
+    const int windowH = juce::jmax (120, targetEditorHeight + frameH);
+    const int y       = bottom ? (userArea.getBottom() - windowH) : userArea.getY();
+
+    // 先放宽 resizeLimits：水平条宽度 = 屏幕宽，高度可能小于默认下限（420）
+    if (auto* cbc = getConstrainer())
+    {
+        setResizeLimits (juce::jmin (cbc->getMinimumWidth(), w), 120,
+                         juce::jmax (cbc->getMaximumWidth(), w),
+                         juce::jmax (cbc->getMaximumHeight(), windowH));
+    }
+
+    if (top == this)
+        setSize (w, juce::jmax (120, targetEditorHeight));
+    else
+        top->setBounds (userArea.getX(), y, w, windowH);
+}
+
 void Y2KmeterAudioProcessorEditor::redockStickAfterGeometryChange()
 {
     if (! stickActive) return;
@@ -3795,6 +4026,9 @@ void Y2KmeterAudioProcessorEditor::enterStickMode()
         {
             workspace->setChromeVisible (false);
             revealArmed = true;   // 用户正在浮层上操作：保持浮现
+
+            // 收起后条高变化：立刻按新高度重新提交占位
+            redockStickAfterGeometryChange();
         }
         return;
     }
@@ -3802,12 +4036,14 @@ void Y2KmeterAudioProcessorEditor::enterStickMode()
     auto* top = getTopLevelComponent();
     setStickOnscreenRelaxed (true);
 
-    // 1) 备份当前布局 + 窗口 bounds + resizeLimits
+    // 1) 备份非 stick 布局（写 0 槽）+ 窗口 bounds + resizeLimits
     //    先把浮动窗口的最新屏幕位置/业务状态同步进 workspace，备份才是最新态。
     syncFloatingWindowStatesToWorkspace();
-    stickBackupLayout = workspace->saveLayoutTree();
+    persistCurrentLayoutToProcessor();                 // stickActive 仍 false → 0 槽
+    stickBackupLayout = workspace->saveLayoutTree();   // 内存兜底（0 槽读取失败时用）
     if (top != nullptr)
         stickBackupWindowBounds = top->getScreenBounds();
+    processor.setSavedStickRestoreBounds (stickBackupWindowBounds);
     if (auto* cbc = getConstrainer())
     {
         stickSavedMinW = cbc->getMinimumWidth();
@@ -3821,24 +4057,65 @@ void Y2KmeterAudioProcessorEditor::enterStickMode()
     //      applyLayoutPreset 会在重建前后快照/写回脱离态记录，因此它们不会
     //      被 clearAllModules 从布局树里抹掉；退出 stick 时再按备份布局恢复。
 
-    // 2) 标记激活 + 切换 Horizontal Bar(T)（贴顶横条）
+    // 2) 标记激活（沿用上次驻留的那一侧）+ 持久化会话，供下次启动自动恢复
     stickActive        = true;
-    stickBottomAligned = false;
-    applyLayoutPreset ((int) ModuleWorkspace::LayoutPreset::horizontalFull);
+    stickBottomAligned = processor.isSavedStickBottom();
+    processor.setSavedStickSession (true, stickBottomAligned);
 
-    // 2.5) AppBar 驻留（缩小工作区，其他窗口让开这条边）。
+    // 3) 先把窗口切成条（高度优先用该侧上次调好的值），再装载布局：
+    //    槽内模块坐标按"条状 canvas"记录，先切窗口可避免加载后被 resized() 夹紧。
+    const int savedH = processor.getSavedStickEditorHeight (stickBottomAligned);
+    if (savedH > 0)
+        applyStickBarGeometry (stickBottomAligned, savedH);
+
+    // 恢复该侧存档布局；首次进入才用默认横向条
+    //   （applyLayoutPreset 末尾会把默认布局写入当前活动槽 = 对应 T/B 槽）。
+    const int enterSlot = stickBottomAligned ? 2 : 1;
+
+    if (! loadSavedStickSlotLayout (enterSlot))
+    {
+        applyLayoutPreset ((int) (stickBottomAligned
+            ? ModuleWorkspace::LayoutPreset::horizontalBottom
+            : ModuleWorkspace::LayoutPreset::horizontalFull));
+    }
+    else if (savedH <= 0)
+    {
+        // 有布局但没记高度（旧数据）：按默认水平条高度 250 切成条
+        applyStickBarGeometry (stickBottomAligned, 250);
+    }
+
+    // 3.5) AppBar 驻留（缩小工作区，其他窗口让开这条边）。
     //      先 dock 再锁宽度：dock 会按「工作区宽 × 窗口高」把窗口搬到贴边矩形，
     //      用搬完后的实际宽度做宽度锁定才准确。
     if (! y2kAppBarDock (getTopLevelComponent(), stickBottomAligned, &stickDockRectPx))
     {
-        // 注册失败（极端环境）——回退到普通横向条，不进入驻留态，
+        // 注册失败（极端环境）——回退到普通窗口，不进入驻留态，
         // 避免工具栏显示 stick 按钮"按下了"但实际没有占位。
         const auto floatingStatesForRollback = workspace->getFloatingModuleStatesRaw();
         stickActive = false;
+        processor.setSavedStickSession (false, stickBottomAligned);
         setStickOnscreenRelaxed (false);
-        applyLayoutPreset ((int) ModuleWorkspace::LayoutPreset::horizontalFull);
-        // 回退时 stickActive 已为 false，preset 不会自动恢复脱离态记录 → 手动写回
+
+        if (auto* cbc = getConstrainer())
+            setResizeLimits (stickSavedMinW, stickSavedMinH, stickSavedMaxW, stickSavedMaxH);
+
+        // 先还原窗口尺寸，再装载布局（避免模块坐标被条状 canvas 夹紧）
+        if (auto* t = getTopLevelComponent())
+            if (! stickBackupWindowBounds.isEmpty())
+                t->setBounds (stickBackupWindowBounds);
+
+        // 回到非 stick 布局（0 槽优先，内存备份兜底）
+        bool layoutRestored = false;
+        const auto normalXml = processor.getSavedLayoutXml (Y2KmeterAudioProcessor::LayoutSlot::normal);
+        if (normalXml.isNotEmpty())
+            layoutRestored = workspace->loadLayoutFromXml (normalXml);
+        if (! layoutRestored && stickBackupLayout.isValid())
+            workspace->loadLayoutFromTree (stickBackupLayout);
+
+        // 回退后 stickActive 已为 false，浮动状态需要手动写回
         workspace->restoreFloatingModuleStates (floatingStatesForRollback);
+
+        processor.setSavedStickRestoreBounds ({});
         repaint();
         return;
     }
@@ -3847,17 +4124,19 @@ void Y2KmeterAudioProcessorEditor::enterStickMode()
     stickPendingHeightPx = stickDockedHeightPx;
     stickStableTicks     = 0;
 
-    // 2.6) 锁宽度：stick 模式只允许调高度，宽度锁死到当前（屏幕工作区）宽。
-    //      applyLayoutPreset 已放宽了高度范围，这里只把宽度 min/max 夹到当前宽。
+    // 3.6) 锁宽度：stick 模式只允许调高度，宽度锁死到当前（屏幕工作区）宽。
     if (auto* cbc = getConstrainer())
     {
         const int w = (top != nullptr) ? top->getWidth() : cbc->getMaximumWidth();
         setResizeLimits (w, cbc->getMinimumHeight(), w, cbc->getMaximumHeight());
     }
 
-    // 3) 更新 UI（隐藏最小化/置顶按钮；toolbar 切换到 X + T/B）
+    // 记录驻留条高度（按当前侧持久化）
+    processor.setSavedStickEditorHeight (stickBottomAligned, stickEditorHeightForSave());
+
+    // 4) 更新 UI（隐藏最小化/置顶按钮；toolbar 切换到 X + T/B）
     repaint();
-    workspace->setStickActive (true);
+    workspace->setStickActive (true, stickBottomAligned);
 }
 
 void Y2KmeterAudioProcessorEditor::exitStickMode()
@@ -3874,7 +4153,14 @@ void Y2KmeterAudioProcessorEditor::exitStickMode()
         return;
     }
 
-    // 1) 取消 AppBar（恢复工作区）
+    // 1) 先把当前 stick 槽布局存盘（用户可能在驻留态里调过模块）
+    if (workspace != nullptr)
+    {
+        syncFloatingWindowStatesToWorkspace();
+        persistCurrentLayoutToProcessor();   // stickActive 仍 true → 当前 T/B 槽
+    }
+
+    // 2) 取消 AppBar（恢复工作区）
     y2kAppBarUndock (getTopLevelComponent());
 
     stickActive = false;
@@ -3883,18 +4169,37 @@ void Y2KmeterAudioProcessorEditor::exitStickMode()
     stickStableTicks     = 0;
     stickDockRectPx      = {};
 
-    // 1.5) 恢复 resizeLimits（解除宽度锁定）
+    // 3) 恢复 resizeLimits（解除宽度锁定）
     setResizeLimits (stickSavedMinW, stickSavedMinH, stickSavedMaxW, stickSavedMaxH);
 
-    // 2) 恢复备份布局 + 窗口 bounds
-    if (workspace != nullptr && stickBackupLayout.isValid())
-        workspace->loadLayoutFromTree (stickBackupLayout);
+    // 4) 先恢复窗口 bounds：优先存档（进入 stick 前的值，跨重启可用），
+    //    内存备份兜底。必须在装载布局之前 —— 模块坐标按 normal 画布记录，
+    //    窗口还是条状时装载会被 resized() 当成越界而夹紧。
+    auto restoreBounds = processor.getSavedStickRestoreBounds();
+    if (restoreBounds.isEmpty())
+        restoreBounds = stickBackupWindowBounds;
 
-    if (auto* top = getTopLevelComponent())
-        if (! stickBackupWindowBounds.isEmpty())
-            top->setBounds (stickBackupWindowBounds);
+    if (! restoreBounds.isEmpty())
+        if (auto* top = getTopLevelComponent())
+            top->setBounds (restoreBounds);
 
-    // 2.5) 备份布局里 floating=true 的模块恢复成浮动窗口。
+    // 5) 恢复非 stick 布局：优先存档 0 槽（跨重启有效），内存备份兜底
+    bool layoutRestored = false;
+    if (workspace != nullptr)
+    {
+        const auto normalXml = processor.getSavedLayoutXml (Y2KmeterAudioProcessor::LayoutSlot::normal);
+        if (normalXml.isNotEmpty())
+            layoutRestored = workspace->loadLayoutFromXml (normalXml);
+
+        if (! layoutRestored && stickBackupLayout.isValid())
+            workspace->loadLayoutFromTree (stickBackupLayout);
+    }
+
+    // 6) 清除 stick 会话存档（方向保留：下次进入仍从上次那一侧开始）
+    processor.setSavedStickSession (false, stickBottomAligned);
+    processor.setSavedStickRestoreBounds ({});
+
+    // 7) 布局里 floating=true 的模块恢复成浮动窗口。
     //      stick 期间一直悬浮的模块（同 moduleId）会被跳过，不会重复创建。
     restoreFloatingWindowsFromWorkspace();
 
@@ -3922,6 +4227,9 @@ void Y2KmeterAudioProcessorEditor::toggleStickTopBottom()
         toggleStickTopBottom();
         workspace->setChromeVisible (false);
         revealArmed = true;
+
+        // 收起后条高变化：立刻按新高度重新提交占位
+        redockStickAfterGeometryChange();
         return;
     }
 
@@ -3930,17 +4238,176 @@ void Y2KmeterAudioProcessorEditor::toggleStickTopBottom()
     // 再 dock 时系统把 [屏幕顶..窗口底] 整段算成占位 → 顶部空出 2 倍高度）。
     y2kAppBarUndock (getTopLevelComponent());
 
-    stickBottomAligned = ! stickBottomAligned;
+    // 1) 保存当前这一侧的布局到它自己的槽（此时 stickActive 仍指向旧侧）
+    if (workspace != nullptr)
+    {
+        syncFloatingWindowStatesToWorkspace();
+        persistCurrentLayoutToProcessor();
+    }
 
-    applyLayoutPreset ((int) (stickBottomAligned
-        ? ModuleWorkspace::LayoutPreset::horizontalBottom
-        : ModuleWorkspace::LayoutPreset::horizontalFull));
+    // 2) 切到另一侧：该侧有存档就直接装载（不重建模块），首次进入才用默认横条
+    stickBottomAligned = ! stickBottomAligned;
+    processor.setSavedStickSession (true, stickBottomAligned);
+
+    const int targetSlot = stickBottomAligned ? 2 : 1;
+
+    // 先把窗口切成另一侧的条（用该侧自己上次调好的高度；首次切过去则沿用
+    //   当前高度），再装载该侧布局，避免模块坐标在旧侧 canvas 上被夹紧。
+    const int targetH = processor.getSavedStickEditorHeight (stickBottomAligned);
+    applyStickBarGeometry (stickBottomAligned,
+                           targetH > 0 ? targetH : stickEditorHeightForSave());
+
+    if (! loadSavedStickSlotLayout (targetSlot))
+    {
+        // 该侧首次进入：用默认横向条（内部会重设窗口几何）
+        applyLayoutPreset ((int) (stickBottomAligned
+            ? ModuleWorkspace::LayoutPreset::horizontalBottom
+            : ModuleWorkspace::LayoutPreset::horizontalFull));
+    }
 
     if (y2kAppBarDock (getTopLevelComponent(), stickBottomAligned, &stickDockRectPx))
     {
         stickDockedHeightPx  = y2kGetWindowHeightPx (getTopLevelComponent());
         stickPendingHeightPx = stickDockedHeightPx;
         stickStableTicks     = 0;
+    }
+
+    // 3) 锁定宽度（applyStickBarGeometry 放宽了 limits；预设路径由预设自行处理）
+    if (auto* cbc = getConstrainer())
+    {
+        const int w = (getTopLevelComponent() != nullptr) ? getTopLevelComponent()->getWidth()
+                                                         : cbc->getMaximumWidth();
+        setResizeLimits (w, cbc->getMinimumHeight(), w, cbc->getMaximumHeight());
+    }
+
+    // 预设下拉切到新一侧的形态指示（HORIZONTAL BAR(T) / (B)）
+    if (workspace != nullptr)
+        workspace->setStickActive (true, stickBottomAligned);
+
+    processor.setSavedStickEditorHeight (stickBottomAligned, stickEditorHeightForSave());
+}
+
+bool Y2KmeterAudioProcessorEditor::loadSavedStickSlotLayout (int slot)
+{
+    if (workspace == nullptr) return false;
+
+    const auto xml = processor.getSavedLayoutXml (
+        static_cast<Y2KmeterAudioProcessor::LayoutSlot> (slot));
+
+    if (xml.isEmpty()) return false;
+    if (! workspace->loadLayoutFromXml (xml)) return false;
+
+    // 槽里不会有 floating 节点（存档时已排除），这里只需把当前仍存活的
+    //   浮动窗口重新登记进 workspace，保证它们不被后续保存"遗忘"。
+    restoreFloatingWindowsFromWorkspace();
+    return true;
+}
+
+void Y2KmeterAudioProcessorEditor::restoreSavedStickSession()
+{
+    const bool restoreBottom = pendingStickBottom;
+
+    // pendingStickRestore 要等整个恢复流程结束才清除：
+    //   restoreSavedStickSession 期间 persistCurrentLayoutToProcessor 依靠它跳过
+    //   写盘，避免把"窗口尺寸尚未正确"时的过渡态布局固化到某个槽。
+    struct PendingReset
+    {
+        bool& flag;
+        ~PendingReset() { flag = false; }
+    } pendingReset { pendingStickRestore };
+
+    if (stickActive || workspace == nullptr || isPluginHost) return;
+
+    auto* top = getTopLevelComponent();
+    if (top == nullptr || getPeer() == nullptr) return;
+
+    // 0) 先切到"逻辑 stick 态"：从这一刻起布局槽映射指向 stick 槽。
+    //    否则下面 setChromeVisible / 装载布局触发的 onLayoutChanged 会把条状
+    //    布局写进非 stick 槽（历史 bug：退出 stick 后原布局丢失）。
+    stickActive        = true;
+    stickBottomAligned = restoreBottom;
+
+    // 1) 先展开 chrome：存档高度是 show 态等效高度，条几何按 show 态铺
+    const bool wasHidden = ! workspace->isChromeVisible();
+    if (wasHidden)
+        workspace->setChromeVisible (true);
+
+    // 2) 备份进入 stick 前的窗口 bounds / resizeLimits（退出时还原）
+    stickBackupWindowBounds = processor.getSavedStickRestoreBounds();
+    if (stickBackupWindowBounds.isEmpty())
+        stickBackupWindowBounds = top->getScreenBounds();
+
+    // 退出 stick 时要恢复的是"普通窗口可调整范围"，而不是构造时的默认 limits：
+    //   启动恢复路径里这里拿到的还是 Editor 默认 limits（例如 max 1600×1100），
+    //   若用户的普通窗口比它大，退出时 setBounds 会被夹回，造成"还原后窗口变小"。
+    if (auto* cbc = getConstrainer())
+    {
+        stickSavedMinW = cbc->getMinimumWidth();
+        stickSavedMinH = cbc->getMinimumHeight();
+        stickSavedMaxW = juce::jmax (cbc->getMaximumWidth(),  stickBackupWindowBounds.getWidth());
+        stickSavedMaxH = juce::jmax (cbc->getMaximumHeight(), stickBackupWindowBounds.getHeight());
+    }
+
+    // 3) 按存档方向/高度铺条（stickActive / 方向已在步骤 0 设置）
+    setStickOnscreenRelaxed (true);
+
+    const int savedH = processor.getSavedStickEditorHeight (stickBottomAligned);
+    applyStickBarGeometry (stickBottomAligned, savedH > 0 ? savedH : 250);
+
+    // 3.5) 启动阶段窗口经历了 normal → 条状 →（可能的）hide 过渡，resized() 的
+    //      clamp 可能把模块高度缩到过渡期的 canvas 尺寸；此时窗口几何已最终就位，
+    //      重载一次存档布局，保证与用户上次调好的逐像素一致。
+    loadSavedStickSlotLayout (stickBottomAligned ? 2 : 1);
+
+    // 4) AppBar 驻留
+    if (! y2kAppBarDock (top, stickBottomAligned, &stickDockRectPx))
+    {
+        // 注册失败：回退到普通窗口 + 非 stick 布局（保持状态机与存档一致）
+        stickActive = false;
+        setStickOnscreenRelaxed (false);
+        setResizeLimits (stickSavedMinW, stickSavedMinH, stickSavedMaxW, stickSavedMaxH);
+        processor.setSavedStickSession (false, stickBottomAligned);
+
+        // 先还原窗口尺寸，再装载布局（避免模块坐标被条状 canvas 夹紧）
+        if (! stickBackupWindowBounds.isEmpty())
+            top->setBounds (stickBackupWindowBounds);
+
+        const auto normalXml = processor.getSavedLayoutXml (Y2KmeterAudioProcessor::LayoutSlot::normal);
+        if (normalXml.isNotEmpty())
+            workspace->loadLayoutFromXml (normalXml);
+        restoreFloatingWindowsFromWorkspace();
+
+        if (wasHidden)
+        {
+            workspace->setChromeVisible (false);
+            revealArmed = true;
+        }
+        return;
+    }
+
+    stickDockedHeightPx  = y2kGetWindowHeightPx (top);
+    stickPendingHeightPx = stickDockedHeightPx;
+    stickStableTicks     = 0;
+
+    // 5) 锁宽度（与 enterStickMode 一致：只允许调高度）
+    if (auto* cbc = getConstrainer())
+    {
+        const int w = top->getWidth();
+        setResizeLimits (w, cbc->getMinimumHeight(), w, cbc->getMaximumHeight());
+    }
+
+    // 6) UI 切到 X + T/B
+    repaint();
+    workspace->setStickActive (true, stickBottomAligned);
+
+    // 7) 存档是 hide 态：最后再收起（与运行时进入 stick 的顺序一致）
+    if (wasHidden)
+    {
+        workspace->setChromeVisible (false);
+        revealArmed = true;
+
+        // 收起后窗口变矮：立刻按新高度重新提交占位，避免工作区残留空档
+        redockStickAfterGeometryChange();
     }
 }
 
@@ -4944,6 +5411,10 @@ void Y2KmeterAudioProcessorEditor::timerCallback()
     updateUiScaleForCurrentDisplay();
 
 #if JUCE_WINDOWS
+    // v2.8.5：启动恢复 stick 会话（等窗口上屏、peer 就绪后再注册 AppBar）
+    if (pendingStickRestore && isShowing() && getPeer() != nullptr)
+        restoreSavedStickSession();
+
     // stick 驻留态：窗口高度被改动 / 窗口被挪走时，重新对齐 AppBar 占位。
     if (stickActive)
         updateStickDockGeometry();

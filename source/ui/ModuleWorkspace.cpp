@@ -453,21 +453,32 @@ ModuleWorkspace::ModuleWorkspace()
     // 布局预设下拉框（位于 Grid 按钮左侧）
     //   · 样式与音频源下拉完全一致：显式挂 PinkXP LookAndFeel，ComboBox 箭头 + 条目
     //     颜色跟随主题；nothing-selected 文本作为占位，选中后触发 onLayoutPresetChanged
-    layoutPresetBox.clear (juce::dontSendNotification);
     layoutPresetBox.setTextWhenNothingSelected ("preset");
     layoutPresetBox.setTooltip ("Choose a layout preset");
-    layoutPresetBox.addItem ("Default",             (int) LayoutPreset::defaultGrid);
-    layoutPresetBox.addItem ("Horizontal Bar(T)",      (int) LayoutPreset::horizontalFull);
-    layoutPresetBox.addItem ("Horizontal Bar(B)", (int) LayoutPreset::horizontalBottom);
-    layoutPresetBox.addItem ("MV",                (int) LayoutPreset::mv);
-    layoutPresetBox.addItem ("Studio Monitor",    (int) LayoutPreset::studioMonitor);
-    layoutPresetBox.addItem ("Focus + Sidecar",   (int) LayoutPreset::focusSidecar);
-    layoutPresetBox.addItem ("Broadcast Loudness",(int) LayoutPreset::broadcastLoudness);
-    layoutPresetBox.addItem ("Only Milkdrop",     (int) LayoutPreset::onlyMilkdrop);
     layoutPresetBox.setLookAndFeel (&getPinkXPLookAndFeel());
+    rebuildLayoutPresetItems();
     layoutPresetBox.onChange = [this]()
     {
         const int id = layoutPresetBox.getSelectedId();
+
+        // stick 驻留态：下拉里只有"当前这一侧"的形态项 —— 选中它表示把该侧
+        //   重置为默认横向条布局（条高与驻留边不变，由 Editor 处理）。
+        if (stickActive)
+        {
+            if (id <= 0) return;
+
+            const auto preset = (LayoutPreset) id;
+            juce::Component::SafePointer<ModuleWorkspace> safe (this);
+            juce::MessageManager::callAsync ([safe, preset]()
+            {
+                if (safe == nullptr) return;
+                if (safe->onLayoutPresetChanged)
+                    safe->onLayoutPresetChanged (preset);
+                safe->layoutPresetBox.setSelectedId (0, juce::dontSendNotification);
+            });
+            return;
+        }
+
         if (id <= 0) return;
         const auto preset = (LayoutPreset) id;
 
@@ -1235,8 +1246,9 @@ void ModuleWorkspace::clearAllModules()
     for (int i = modules.size(); --i >= 0;)
         modules.remove (i);
 
-    // ★ Bug3修复：清空脱离态记录（预设切换时所有模块归零）
-    floatingModuleStates_.clear();
+    // 注意：不清空 floatingModuleStates_。
+    //   脱离态模块独立于布局管理 —— stick 切换 / 预设重建 canvas 时，
+    //   浮动窗口必须继续存在，不能因为清空 canvas 就把它们的记录一并丢掉。
 
     // 同步清理拼豆贴画：先清 layer（子 Component）再清数据结构，避免 layer->img 野指针
     perlerLayers.clear();
@@ -1461,6 +1473,21 @@ void ModuleWorkspace::showAddMenu(juce::Point<int> anchorScreenPos,
     }
 
     options = options.withTargetScreenArea (targetArea);
+
+   #if JUCE_WINDOWS
+    // stick 驻留态：AppBar 把条带从系统工作区（userArea）里挖掉了，JUCE 默认会把
+    //   菜单整体 clamp 到 userArea，结果菜单被顶到条带上方、远离鼠标。这里把允许
+    //   区域放宽到整个显示器，让菜单贴着点击位置弹出（可以盖在条带上）。
+    //   withParentAreaOverride 是本仓库 JUCE 的本地扩展；用平台宏包住，保证
+    //   macOS 端即使链接官方 JUCE 也能编译。
+    if (PinkXP::isStickDockActive())
+    {
+        if (const auto* display = juce::Desktop::getInstance().getDisplays()
+                                      .getDisplayForPoint (targetArea.getCentre()))
+            options = options.withParentAreaOverride (
+                display->safeAreaInsets.subtractedFrom (display->totalArea));
+    }
+   #endif
 
     const auto placePos = placeAtCanvasPos;
 
@@ -2510,7 +2537,8 @@ void ModuleWorkspace::resized()
             // 布局预设下拉框：与音频源下拉同高。
             //   · 弹出菜单的宽度由 PinkXPLookAndFeel::getIdealPopupMenuItemSize
             //     按实际文字宽度自适应撑开，所以这里 ComboBox 本体保持紧凑即可。
-            const int layoutBoxW = PinkXP::ui(150);
+            //    stick 驻留态条目文案更长（HORIZONTAL BAR(T)/(B)），给足宽度避免截断
+            const int layoutBoxW = PinkXP::ui (stickActive ? 200 : 150);
             auto layoutArea = tb.removeFromRight (layoutBoxW);
             layoutPresetBox.setBounds (layoutArea.withSizeKeepingCentre (layoutBoxW, btnH));
             layoutPresetBox.setVisible (true);
@@ -2548,7 +2576,15 @@ void ModuleWorkspace::resized()
 #if JUCE_WINDOWS
         // stick 按钮组（Windows 专属）：贴在 Save/Load 左侧、themeBar 右侧
         //   · 未激活：显示 "Stick"；激活：显示 "X"（退出）+ "T/B"（顶/底切换）
-        if (stickActive)
+        //   · 插件宿主模式（stickUiVisible=false）：整组隐藏，且不占工具栏宽度
+        //     （否则 DAW 里会把宿主窗口注册成 AppBar）
+        if (! stickUiVisible)
+        {
+            stickBtn.setVisible       (false);
+            stickExitBtn.setVisible   (false);
+            stickToggleBtn.setVisible (false);
+        }
+        else if (stickActive)
         {
             tb.removeFromRight (4);
             auto toggleArea = tb.removeFromRight (btnW);
@@ -2847,15 +2883,76 @@ void ModuleWorkspace::setLayoutPresetUiVisible (bool shouldBeVisible)
     repaint();
 }
 
-void ModuleWorkspace::setStickActive (bool active)
+void ModuleWorkspace::setStickActive (bool active, bool bottomAligned)
 {
-    if (stickActive == active) return;
-    stickActive = active;
+    // 方向变化也要刷新（T ↔ B 切换时 active 仍为 true，不能提前 return）
+    const bool bottomChanged = active && (stickBottomAligned != bottomAligned);
+
+    if (stickActive == active && ! bottomChanged) return;
+
+    stickActive        = active;
+    stickBottomAligned = active && bottomAligned;
+
+    // 同步给 LookAndFeel：驻留态的 ComboBox 下拉要把锚点挪到条带与工作区的
+    //   交界线（AppBar 已把条带从 userArea 里挖掉，默认锚点会被 clamp 到别处）。
+    PinkXP::setStickDockState (stickActive, stickBottomAligned);
 
     // 未激活显示 STICK，激活显示 X + T/B（STICK 隐藏）
-    stickBtn.setVisible       (! active);
-    stickExitBtn.setVisible   (active);
-    stickToggleBtn.setVisible (active);
+    stickBtn.setVisible       (stickUiVisible && ! active);
+    stickExitBtn.setVisible   (stickUiVisible && active);
+    stickToggleBtn.setVisible (stickUiVisible && active);
+
+    // stick 态的预设下拉只保留"当前这一侧"的横向条；退出后恢复完整列表
+    rebuildLayoutPresetItems();
+
+    resized();
+    repaint();
+}
+
+void ModuleWorkspace::rebuildLayoutPresetItems()
+{
+    layoutPresetBox.clear (juce::dontSendNotification);
+
+    // 驻留态：窗口已经是「屏幕宽 × 条高」，其它预设会把窗口改成别的形状
+    //   并破坏 AppBar 占位，因此只保留当前这一侧的横向条。
+    //   · 用 placeholder 呈现形态文本（selectedId 保持 0）：ComboBox 对"重复
+    //     选中同一项"不会发 onChange，若预选中，用户点它就没有任何反应。
+    if (stickActive)
+    {
+        const int id = stickBottomAligned ? (int) LayoutPreset::horizontalBottom
+                                          : (int) LayoutPreset::horizontalFull;
+        const juce::String label = stickBottomAligned ? "HORIZONTAL BAR(B)"
+                                                      : "HORIZONTAL BAR(T)";
+
+        layoutPresetBox.setTextWhenNothingSelected (label);
+        layoutPresetBox.addItem (label, id);
+        layoutPresetBox.setSelectedId (0, juce::dontSendNotification);
+        return;
+    }
+
+    layoutPresetBox.setTextWhenNothingSelected ("preset");
+    layoutPresetBox.addItem ("Default",             (int) LayoutPreset::defaultGrid);
+    layoutPresetBox.addItem ("Horizontal Bar(T)",   (int) LayoutPreset::horizontalFull);
+    layoutPresetBox.addItem ("Horizontal Bar(B)",   (int) LayoutPreset::horizontalBottom);
+    layoutPresetBox.addItem ("MV",                  (int) LayoutPreset::mv);
+    layoutPresetBox.addItem ("Studio Monitor",      (int) LayoutPreset::studioMonitor);
+    layoutPresetBox.addItem ("Focus + Sidecar",     (int) LayoutPreset::focusSidecar);
+    layoutPresetBox.addItem ("Broadcast Loudness",  (int) LayoutPreset::broadcastLoudness);
+    layoutPresetBox.addItem ("Only Milkdrop",       (int) LayoutPreset::onlyMilkdrop);
+    layoutPresetBox.setSelectedId (0, juce::dontSendNotification);
+}
+
+void ModuleWorkspace::setStickUiVisible (bool shouldBeVisible)
+{
+    if (stickUiVisible == shouldBeVisible) return;
+    stickUiVisible = shouldBeVisible;
+
+    if (! shouldBeVisible)
+    {
+        stickBtn.setVisible       (false);
+        stickExitBtn.setVisible   (false);
+        stickToggleBtn.setVisible (false);
+    }
 
     resized();
     repaint();
@@ -3054,11 +3151,12 @@ static const juce::Identifier kPropOpacity  ("perlerOpacity");
 static const juce::Identifier kPropVirtuPetRoleName ("virtuPetRoleName");
 static const juce::Identifier kPropVirtuPetHunger   ("virtuPetHunger");
 static const juce::Identifier kPropVirtuPetHealth   ("virtuPetHealth");
-static const juce::Identifier kPropFloating     ("floating");  // 模块是否处于脱离态（Standalone 模式）
-static const juce::Identifier kPropScreenX  ("sx");  // 浮动窗口屏幕 X 坐标（持久化用）
-static const juce::Identifier kPropScreenY  ("sy");  // 浮动窗口屏幕 Y 坐标（持久化用）
-static const juce::Identifier kPropScreenW  ("sw");  // 浮动窗口屏幕宽度（持久化用）
-static const juce::Identifier kPropScreenH  ("sh");  // 浮动窗口屏幕高度（持久化用）
+static const juce::Identifier kPropFloating     ("floating");  // 脱离态标记（旧存档兼容）
+static const juce::Identifier kPropScreenX  ("sx");  // 浮动窗口屏幕 X 坐标（独立存档用）
+static const juce::Identifier kPropScreenY  ("sy");  // 浮动窗口屏幕 Y 坐标（独立存档用）
+static const juce::Identifier kPropScreenW  ("sw");  // 浮动窗口屏幕宽度（独立存档用）
+static const juce::Identifier kPropScreenH  ("sh");  // 浮动窗口屏幕高度（独立存档用）
+static const juce::Identifier kFloatingRoot ("PBEQ_FloatingModules");
 
 juce::ValueTree ModuleWorkspace::saveLayoutTree() const
 {
@@ -3143,37 +3241,14 @@ juce::ValueTree ModuleWorkspace::saveLayoutTree() const
         // 其他 chrome 子组件（按钮 / 下拉 / themeBar / 浮层等）不持久化
     }
 
-    // ★ Bug3修复：写入脱离态模块节点（它们不在 getChildren() 中）
-    //   脱离态模块由 Editor 的 FloatingModuleWindow 持有，不在此组件树内，
-    //   但 floatingModuleStates_ 记录了它们的 moduleId 和脱离前的原始 bounds。
-    for (const auto& [id, state] : floatingModuleStates_)
-    {
-        juce::ValueTree node(kLayoutModule);
-        node.setProperty(kPropFloating, true, nullptr);
-        node.setProperty(kPropType, moduleTypeToString(state.type), nullptr);
-        node.setProperty(kPropId,   id,      nullptr);
-        // workspace 内坐标（dock 回位用）
-        node.setProperty(kPropX, state.bounds.getX(),      nullptr);
-        node.setProperty(kPropY, state.bounds.getY(),      nullptr);
-        node.setProperty(kPropW, state.bounds.getWidth(),  nullptr);
-        node.setProperty(kPropH, state.bounds.getHeight(), nullptr);
-        // 浮动窗口屏幕坐标（持久化用，resize 后更新）
-        if (!state.screenBounds.isEmpty())
-        {
-            node.setProperty(kPropScreenX, state.screenBounds.getX(),      nullptr);
-            node.setProperty(kPropScreenY, state.screenBounds.getY(),      nullptr);
-            node.setProperty(kPropScreenW, state.screenBounds.getWidth(),  nullptr);
-            node.setProperty(kPropScreenH, state.screenBounds.getHeight(), nullptr);
-        }
-        if (state.moduleState.isValid())
-            node.appendChild(state.moduleState, nullptr);
-        tree.appendChild(node, nullptr);
-    }
+    // 脱离态（floating）模块不写入布局槽：
+    //   布局槽只描述 canvas 内模块，切换 stick T/B 时不应该重建 / 丢失浮动模块。
+    //   浮动模块由 saveFloatingModulesTree() 单独存档（独立于所有槽）。
 
     return tree;
 }
 
-bool ModuleWorkspace::loadLayoutFromTree(const juce::ValueTree& tree)
+bool ModuleWorkspace::loadLayoutFromTree(const juce::ValueTree& tree, bool importLegacyFloating)
 {
     if (! tree.hasType(kLayoutRoot))
         return false;
@@ -3198,12 +3273,11 @@ bool ModuleWorkspace::loadLayoutFromTree(const juce::ValueTree& tree)
     if (tree.hasProperty ("inputGainDb"))
         setInputGainDb ((float) (double) tree.getProperty ("inputGainDb", 0.0));
 
-    // 清空现有模块、脱离态记录 + 拼豆贴画。
-    // loadLayoutFromTree 会从传入的布局树完整重建 floatingModuleStates_；
-    // 若不先清空，旧布局中的浮动模块会残留并在下一次保存/恢复时重复实例化。
+    // 清空现有 canvas 模块 + 拼豆贴画。
+    //   注意：不动 floatingModuleStates_ —— 布局槽只负责 canvas 内模块，
+    //   脱离态模块由独立的浮动记录（loadFloatingModulesFromTree）维护。
     for (int i = modules.size(); --i >= 0;)
         modules.remove(i);
-    floatingModuleStates_.clear();
     // 同步清理拼豆贴画：先清 layer（子 Component）再清数据结构
     perlerLayers.clear();
     perlerImages.clear();
@@ -3251,38 +3325,41 @@ bool ModuleWorkspace::loadLayoutFromTree(const juce::ValueTree& tree)
 
         if (! node.hasType(kLayoutModule)) continue;
 
-        // Bug3修复：floating=true 的节点仅记录为脱离态信息，不立即加入 workspace
-        // 它们将在 Editor 完成所有模块加载后，通过 floatingModuleStates_ 恢复
-        const bool isFloating = (bool) node.getProperty(kPropFloating, false);
-        if (isFloating)
+        // 脱离态（floating）节点：不属于布局槽。
+        //   只在导入旧版"裸布局文件"时迁移进独立记录；槽位加载一律忽略 ——
+        //   否则切换 stick 时会按槽里的旧记录重建已删除的浮动模块。
+        if ((bool) node.getProperty(kPropFloating, false))
         {
-            const auto idStr = node.getProperty(kPropId).toString();
-            if (idStr.isNotEmpty())
+            if (importLegacyFloating)
             {
-                maxId = juce::jmax(maxId, idStr.getIntValue());
-                const int x = (int) node.getProperty(kPropX, 0);
-                const int y = (int) node.getProperty(kPropY, 0);
-                const int w = (int) node.getProperty(kPropW, 320);
-                const int h = (int) node.getProperty(kPropH, 220);
-                bool typeOk = false;
-                const auto ftStr = node.getProperty(kPropType).toString();
-                const auto ftType = stringToModuleType(ftStr, &typeOk);
-                const ModuleType storedType = typeOk ? ftType : ModuleType::eq;
-                FloatingState fState{ storedType, { x, y, w, h }, {}, {} };
-                auto stateChild = node.getChildWithName("state");
-                if (stateChild.isValid())
-                    fState.moduleState = stateChild;
-                // 读取屏幕坐标（存在表示脱离后用户调整过窗口位置/大小）
-                if (node.hasProperty(kPropScreenX) && node.hasProperty(kPropScreenY))
+                const auto idStr = node.getProperty (kPropId).toString();
+                if (idStr.isNotEmpty())
                 {
-                    fState.screenBounds = {
-                        (int) node.getProperty(kPropScreenX, x),
-                        (int) node.getProperty(kPropScreenY, y),
-                        (int) node.getProperty(kPropScreenW, w),
-                        (int) node.getProperty(kPropScreenH, h)
-                    };
+                    bool typeOk = false;
+                    const auto type = stringToModuleType (node.getProperty (kPropType).toString(), &typeOk);
+                    if (typeOk)
+                    {
+                        FloatingState legacy;
+                        legacy.type   = type;
+                        legacy.bounds = { (int) node.getProperty (kPropX, 0),
+                                          (int) node.getProperty (kPropY, 0),
+                                          (int) node.getProperty (kPropW, 320),
+                                          (int) node.getProperty (kPropH, 220) };
+                        if (node.hasProperty (kPropScreenX) && node.hasProperty (kPropScreenY))
+                        {
+                            legacy.screenBounds = { (int) node.getProperty (kPropScreenX, legacy.bounds.getX()),
+                                                    (int) node.getProperty (kPropScreenY, legacy.bounds.getY()),
+                                                    (int) node.getProperty (kPropScreenW, legacy.bounds.getWidth()),
+                                                    (int) node.getProperty (kPropScreenH, legacy.bounds.getHeight()) };
+                        }
+                        auto stateChild = node.getChildWithName ("state");
+                        if (stateChild.isValid())
+                            legacy.moduleState = stateChild.createCopy();
+
+                        floatingModuleStates_[idStr] = legacy;
+                        maxId = juce::jmax (maxId, idStr.getIntValue());
+                    }
                 }
-                floatingModuleStates_[idStr] = fState;
             }
             continue;
         }
@@ -3355,13 +3432,120 @@ juce::String ModuleWorkspace::saveLayoutAsXml() const
     return {};
 }
 
-bool ModuleWorkspace::loadLayoutFromXml(const juce::String& xmlString)
+// ----------------------------------------------------------
+// 脱离态模块独立存档（与 normal / stick T / stick B 槽解耦）
+// ----------------------------------------------------------
+juce::ValueTree ModuleWorkspace::saveFloatingModulesTree() const
+{
+    juce::ValueTree tree (kFloatingRoot);
+
+    for (const auto& [id, state] : floatingModuleStates_)
+    {
+        juce::ValueTree node (kLayoutModule);
+        node.setProperty (kPropFloating, true, nullptr);
+        node.setProperty (kPropType, moduleTypeToString (state.type), nullptr);
+        node.setProperty (kPropId,   id, nullptr);
+        // dock 回位用的 workspace 内坐标
+        node.setProperty (kPropX, state.bounds.getX(),      nullptr);
+        node.setProperty (kPropY, state.bounds.getY(),      nullptr);
+        node.setProperty (kPropW, state.bounds.getWidth(),  nullptr);
+        node.setProperty (kPropH, state.bounds.getHeight(), nullptr);
+        // 浮动窗口实际屏幕坐标
+        if (! state.screenBounds.isEmpty())
+        {
+            node.setProperty (kPropScreenX, state.screenBounds.getX(),      nullptr);
+            node.setProperty (kPropScreenY, state.screenBounds.getY(),      nullptr);
+            node.setProperty (kPropScreenW, state.screenBounds.getWidth(),  nullptr);
+            node.setProperty (kPropScreenH, state.screenBounds.getHeight(), nullptr);
+        }
+        if (state.moduleState.isValid())
+            node.appendChild (state.moduleState.createCopy(), nullptr);
+
+        tree.appendChild (node, nullptr);
+    }
+
+    return tree;
+}
+
+juce::String ModuleWorkspace::saveFloatingModulesAsXml() const
+{
+    const auto tree = saveFloatingModulesTree();
+    if (auto xml = tree.createXml())
+        return xml->toString (juce::XmlElement::TextFormat{}.singleLine());
+    return {};
+}
+
+void ModuleWorkspace::loadFloatingModulesFromTree (const juce::ValueTree& tree)
+{
+    floatingModuleStates_.clear();
+    if (! tree.isValid())
+        return;
+
+    int maxId = 0;
+
+    for (int i = 0; i < tree.getNumChildren(); ++i)
+    {
+        const auto node = tree.getChild (i);
+        if (! node.hasType (kLayoutModule))
+            continue;
+
+        const auto idStr = node.getProperty (kPropId).toString();
+        if (idStr.isEmpty())
+            continue;
+
+        bool typeOk = false;
+        const auto type = stringToModuleType (node.getProperty (kPropType).toString(), &typeOk);
+        if (! typeOk)
+            continue;
+
+        FloatingState state;
+        state.type   = type;
+        state.bounds = { (int) node.getProperty (kPropX, 0),
+                         (int) node.getProperty (kPropY, 0),
+                         (int) node.getProperty (kPropW, 320),
+                         (int) node.getProperty (kPropH, 220) };
+
+        if (node.hasProperty (kPropScreenX) && node.hasProperty (kPropScreenY))
+        {
+            state.screenBounds = { (int) node.getProperty (kPropScreenX, state.bounds.getX()),
+                                   (int) node.getProperty (kPropScreenY, state.bounds.getY()),
+                                   (int) node.getProperty (kPropScreenW, state.bounds.getWidth()),
+                                   (int) node.getProperty (kPropScreenH, state.bounds.getHeight()) };
+        }
+
+        auto stateChild = node.getChildWithName ("state");
+        if (stateChild.isValid())
+            state.moduleState = stateChild.createCopy();
+
+        floatingModuleStates_[idStr] = state;
+        maxId = juce::jmax (maxId, idStr.getIntValue());
+    }
+
+    if (maxId > 0)
+        nextIdCounter = juce::jmax (nextIdCounter, maxId + 1);
+}
+
+void ModuleWorkspace::loadFloatingModulesFromXml (const juce::String& xmlString)
+{
+    if (xmlString.isEmpty())
+    {
+        floatingModuleStates_.clear();
+        return;
+    }
+
+    if (auto xml = juce::parseXML (xmlString))
+        loadFloatingModulesFromTree (juce::ValueTree::fromXml (*xml));
+    else
+        floatingModuleStates_.clear();
+}
+
+bool ModuleWorkspace::loadLayoutFromXml(const juce::String& xmlString, bool importLegacyFloating)
 {
     if (xmlString.isEmpty()) return false;
     if (auto xml = juce::parseXML(xmlString))
     {
         const auto tree = juce::ValueTree::fromXml(*xml);
-        return loadLayoutFromTree(tree);
+        return loadLayoutFromTree(tree, importLegacyFloating);
     }
     return false;
 }

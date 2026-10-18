@@ -150,7 +150,24 @@ namespace PinkXP
     float uiScale() noexcept;                                   // 当前密度缩放因子
     int   ui (int px) noexcept;                                 // round(px * uiScale())，最小 1
     void  setUiScale (float s) noexcept;                        // 由 Editor 按显示器分辨率设置
-    float uiScaleForDisplay (const juce::Rectangle<int>& userArea) noexcept; // 按逻辑分辨率计算建议缩放
+
+    // 按显示屏逻辑分辨率计算建议缩放。参数由 Editor 的 resolveUiScaleArea() 提供：
+    //   · Windows → totalArea（userArea 会被任务栏 / 自己的 AppBar 驻留压缩，
+    //     stick 条拉高时会误判矮屏）；
+    //   · macOS   → userArea（菜单栏 / Dock 是真实可用空间，且没有 stick/AppBar）。
+    float uiScaleForDisplay (const juce::Rectangle<int>& displayArea) noexcept;
+
+    // ==========================================================
+    // stick 驻留态（Windows AppBar）
+    //   AppBar 会真实压缩系统工作区（userArea），而 JUCE 的 PopupMenu /
+    //   ComboBox 下拉用 userArea 做边界约束 —— 不告诉它驻留状态的话，菜单会
+    //   被整体推到条带上方、远离鼠标。这里由 Editor 在进入/退出/切换 T/B 时
+    //   更新；LnF 依此把弹窗的允许区域放宽到整个显示器，让菜单贴着控件/鼠标
+    //   弹出（可以盖在条带上）。macOS 不会进入该状态。
+    // ==========================================================
+    void setStickDockState (bool active, bool bottom) noexcept;
+    bool isStickDockActive() noexcept;
+    bool isStickDockBottom() noexcept;
 
     // 格式化频率读数：<1kHz 显示 "xxx Hz"，>=1kHz 显示 "x.x kHz"
     juce::String formatFreqHz(float hz);
@@ -296,6 +313,11 @@ public:
                       int buttonW, int buttonH, juce::ComboBox&) override;
     juce::Font getComboBoxFont(juce::ComboBox&) override;
     void positionComboBoxText(juce::ComboBox&, juce::Label&) override;
+
+    // stick 驻留态：条带内的下拉框位于 AppBar 压缩后的工作区之外，JUCE 会把
+    //   弹出菜单整体推到条带上方。这里放宽弹窗的允许区域（到整个显示器），
+    //   让菜单按默认逻辑贴着下拉框展开，可以盖在条带上。
+    juce::PopupMenu::Options getOptionsForComboBoxPopupMenu (juce::ComboBox&, juce::Label&) override;
 };
 
 // 进程级单例 LookAndFeel

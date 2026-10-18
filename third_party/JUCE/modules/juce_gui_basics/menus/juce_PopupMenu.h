@@ -564,6 +564,23 @@ public:
         /** Sets the direction of the popup menu relative to the target screen area. */
         [[nodiscard]] Options withPreferredPopupDirection (PopupDirection direction) const;
 
+        /** Sets a custom screen area within which the popup window will be constrained.
+
+            By default the menu is constrained to the display's user area (i.e. the
+            part of the display not covered by taskbars or other reserved desktop
+            space). Apps that reserve desktop space themselves (for example by
+            registering a window as an AppBar) can pass a larger area, such as the
+            display's total area, so that menus opened from the reserved strip are
+            placed next to their target instead of being pushed into the remaining
+            work area.
+
+            The area is in screen coordinates. An empty area restores the default.
+        */
+        [[nodiscard]] Options withParentAreaOverride (Rectangle<int> area) const;
+
+        /** Gets the custom parent area set with withParentAreaOverride(). */
+        Rectangle<int> getParentAreaOverride() const noexcept        { return parentAreaOverride; }
+
         /** Sets an item to select in the menu.
 
             This is useful for controls such as combo boxes, where opening the combo box
@@ -659,6 +676,7 @@ public:
     private:
         //==============================================================================
         Rectangle<int> targetArea;
+        Rectangle<int> parentAreaOverride; // 非空时覆盖 userArea，允许弹窗越过 AppBar 等保留区
         WeakReference<Component> targetComponent, parentComponent, componentToWatchForDeletion, topLevelTarget;
         int visibleItemID = 0, minWidth = 0, minColumns = 1, maxColumns = 0, standardHeight = 0, initiallySelectedItemId = 0;
         bool isWatchingForDeletion = false;
