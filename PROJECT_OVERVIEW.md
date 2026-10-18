@@ -3725,37 +3725,125 @@ Milkdrop 脱离态由 `GLView` 自己的本地 OpenGL 线程驱动渲染。切�
 
 ## v2.8.6：Stick 三槽布局与浮动模块独立存档
 
-> 详细设计、存档格式、关键代码位置与测试清单见 [`docs/Stick_Floating_Module_v2.8.6.md`](docs/Stick_Floating_Module_v2.8.6.md)。
-
-本轮把"布局形态"与"脱离模块"彻底拆开，解决 Stick 与常驻布局互相覆盖、脱离模块在切换 Stick 时反复复活/丢失的问题。
+本轮把"布局形态"与"脱离模块"彻底拆开，解决 Stick 与常驻布局互相覆盖、脱离模块在切换 Stick 时反复复活/丢失的问题，并修复驻留态弹出菜单被 AppBar 挤出窗口的定位错误。
 
 ### 1. 布局三槽
 
-- `Y2KmeterAudioProcessor::LayoutSlot { normal, stickTop, stickBottom }`；
-- 所有写盘统一走 `persistCurrentLayoutToProcessor()`，按当前形态写对应槽；Stick 进入/退出/T↔B、预设切换、settings 导入导出、析构全部接入；
-- 存档新增 `<PBEQ_LayoutStickTop>` / `<PBEQ_LayoutStickBottom>`，旧 `<PBEQ_Layout>` 自动视为 normal；
-- Stick 会话（active/bottom/两侧条高/进入前窗口 bounds）一并持久化，重启后自动恢复条状驻留。
+v2.8.1 引入 Stick 后，条状窗口与常驻窗口共用一份 `savedLayoutXml`，导致进入 Stick 后条状布局覆盖普通布局、T/B 两侧互相覆盖。本轮改为：
 
-### 2. 浮动模块独立存档
+```cpp
+enum class LayoutSlot { normal = 0, stickTop = 1, stickBottom = 2 };
+```
 
-- 三槽只保存 canvas 内模块；脱离模块写入独立的 `<PBEQ_FloatingModules>`（moduleId、类型、dock 回位 bounds、屏幕坐标、业务 state）；
-- `clearAllModules()` / 布局加载不再清空浮动记录，切换 Stick、切换 T/B 不影响浮动窗口；
-- 弹出、停靠、关闭浮动模块都会触发写盘；启动时先装载浮动记录，再在回调就绪后统一重建窗口；
-- 旧存档迁移：只从 normal 槽提取 floating 节点；旧 Stick 槽里的浮动记录刻意忽略（它们会导致已删除模块复活）。
+- `Y2KmeterAudioProcessorEditor::activeLayoutSlot()` 按当前形态返回槽号；`pendingStickRestore` 期间提前返回 Stick 槽，避免启动过渡态写进普通槽；
+- 所有"保存当前布局"的路径统一走 `persistCurrentLayoutToProcessor()`：`onLayoutChanged`、`flushPendingUiStateBeforeSave`、`applyLayoutPreset`、`saveStateAsSettingsFile`、Editor 析构、Stick 进入/退出/T↔B；
+- 存档新增 `<PBEQ_LayoutStickTop>` / `<PBEQ_LayoutStickBottom>`；旧 `<PBEQ_Layout>` 自动视为 normal 槽；
+- Stick 会话一并持久化：`stickActive`、`stickBottom`、`stickEditorHTop/Bottom`（顶/底各自条高，hide 态折算回 show 态）、`stickRestoreX/Y/W/H`（进入 Stick 前的普通窗口 bounds）；
+- 启动流程：`loadInitialModules()` 先装载对应 Stick 槽 → 窗口上屏后 `timerCallback → restoreSavedStickSession()` 补做条状几何 + AppBar 驻留；Stick 槽缺失时放弃自动驻留并回退普通槽。
 
-### 3. 驻留态弹出菜单
+### 2. Stick 运行流程
 
-- 根因是 JUCE `PopupMenu` 把菜单整体 clamp 到 `display->userArea`，而 AppBar 把条带从工作区挖掉；
-- 给本地 JUCE 增加 `PopupMenu::Options::withParentAreaOverride()`：Stick 态把允许区域放宽到整个显示器；
-- 预设下拉（`PinkXPStyle::getOptionsForComboBoxPopupMenu`）与右键"添加模块"菜单（`ModuleWorkspace::showAddMenu`）均已接入，菜单贴着控件/鼠标弹出；
-- 调用处用 `#if JUCE_WINDOWS` 包住，macOS 可用官方 JUCE 编译。
+- 进入 / 退出 / T↔B 的统一顺序：**先保存当前槽 → 切窗口几何 → 装载目标槽 → AppBar dock → 锁宽度**，避免模块坐标被旧 canvas 夹紧；
+- `applyStickBarGeometry()` 只把窗口铺成"屏幕宽 × 指定 Editor 高"并贴顶/贴底，不重建模块；
+- `ModuleWorkspace::setStickActive(active, bottomAligned)` 同步按钮组与预设下拉：驻留态只保留当前一侧的 `HORIZONTAL BAR(T)/(B)` 一项；
+- `setStickUiVisible(false)` 用于插件宿主（VST3/AU）：Stick 按钮组整组隐藏且不占工具栏宽度，避免把宿主顶层窗口注册成 AppBar；
+- 驻留条高按侧独立保存，T 侧拉高不影响 B 侧。
 
-### 4. 跨平台与构建
+### 3. 浮动模块独立存档
 
-- Stick / AppBar / 三槽映射全部在 Windows 条件编译内；mac 上 `activeLayoutSlot()` 恒 0；
-- UI 密度缩放：Windows 用 `Display::totalArea`（避免 AppBar 压缩 userArea 误判矮屏），mac 保持 `userArea`；
-- 版本 2.8.5 → **2.8.6**；安装包 `dist/Y2Kmeter_Setup_2.8.6_x64.exe`；
-- **踩坑**：只改版本号后增量构建不会重写 JUCE 生成的 `*_resources.rc`，需删除该文件再构建才能刷新 EXE/VST3 的版本信息。
+设计原则：**脱离模块独立于布局管理**——不属于 normal / stickTop / stickBottom 任何槽，切换 Stick、切换槽位不会重建或丢失；但它们仍然写入存档，重启后恢复。
+
+- `ModuleWorkspace::saveFloatingModulesTree()` / `saveFloatingModulesAsXml()`：根节点 `PBEQ_FloatingModules`，子节点 `<Module floating="true" ...>`，记录 `type` / `id`、dock 回位 bounds（workspace 内 `x/y/w/h`）、浮动窗口屏幕坐标 `sx/sy/sw/sh`、`<state>` 业务状态；
+- `loadFloatingModulesFromTree()` / `loadFloatingModulesFromXml()`：整体替换 `floatingModuleStates_`，并抬高 `nextIdCounter`；
+- 三槽的 `saveLayoutTree()` 只写 canvas 内模块；`loadLayoutFromTree()` 不再清空、也不解析槽里的 floating 节点；
+- `clearAllModules()` 不再清空浮动记录：切换预设 / 重建 Stick 条时，浮动窗口必须继续存在；
+- 弹出模块（`popOutModule`）、停靠（`dockModule`）、关闭浮动模块（`removeFloatingState`）都会触发 `notifyLayoutChanged()` → debounce 后写盘；
+- `persistCurrentLayoutToProcessor()` 保存前统一 `syncFloatingWindowStatesToWorkspace()`，同步窗口真实位置与模块状态；
+- 启动时 `loadInitialModules()` 在装载任何布局**之前**先 `loadFloatingModulesFromXml()`，防止启动阶段 `applyLayoutPreset` 写盘把记录覆盖成空；窗口创建统一放到 `onModulePopOutRequested` 接线后的 `restoreFloatingWindowsFromWorkspace()`；
+- 导入 settings 后 `reloadFloatingModuleRecordsFromProcessor()` + `restoreFloatingWindowsFromWorkspace()` 对齐窗口。
+
+**旧存档迁移**：旧版把 floating 节点写在布局里。`setStateInformation()` 在没有 `<PBEQ_FloatingModules>` 时，从 **normal 槽** 提取 `floating="true"` 节点迁移到独立存档；**旧 Stick 槽里的 floating 记录一律忽略**（它们正是"切换 Stick 后已删除模块复活"的来源）。导入旧版裸布局文件时，`loadLayoutFromXml(xml, /*importLegacyFloating*/ true)` 会把浮动节点迁移进独立记录。
+
+### 4. 驻留态弹出菜单定位
+
+根因：JUCE `PopupMenu::MenuWindow::getParentArea()` 把菜单整体约束到 `display->userArea`，而 AppBar 把条带从系统工作区挖掉，导致条带内的 ComboBox 下拉、右键"添加模块"菜单被推到条带上方、远离控件/鼠标；仅挪锚点无效，最终仍会被 clamp。
+
+方案：
+
+- 给本地 JUCE 增加可选约束区域：`PopupMenu::Options::withParentAreaOverride(Rectangle<int>)` / `getParentAreaOverride()`，默认空 → 行为与官方 JUCE 一致；
+- `PinkXPStyle.cpp`：Stick 态且 ComboBox 位于 `userArea` 之外时，把允许区域设为 `safeAreaInsets.subtractedFrom(totalArea)`，菜单按默认逻辑贴着下拉框展开（可覆盖条带）；
+- `ModuleWorkspace::showAddMenu()`：Stick 态同样放宽允许区域，右键菜单贴着点击位置弹出；
+- 两处调用均用 `#if JUCE_WINDOWS` 包住，macOS 即使使用未打补丁的官方 JUCE 也能编译；JUCE 补丁本身需随仓库提交。
+
+### 5. 跨平台
+
+| 项 | Windows | macOS |
+|---|---|---|
+| Stick / AppBar / 三槽 | 完整启用 | 全部在 `#if JUCE_WINDOWS` 内，不执行；`activeLayoutSlot()` 恒 0 |
+| 浮动模块独立存档 | 启用 | 同样启用（Standalone 的 pop-out 在 mac 也可用） |
+| 弹出菜单 override | AppBar 态生效 | 不生效；`isStickDockActive()` 恒 false |
+| UI 密度缩放 | 用 `Display::totalArea`（避免 AppBar 压缩 userArea 误判矮屏） | 保持 `Display::userArea`（菜单栏 / Dock 属真实可用空间） |
+| Stick 按钮 | Standalone 显示；插件宿主隐藏 | 按钮不创建 |
+
+`resolveUiScaleArea()`（`PluginEditor.cpp`）统一了两处缩放判据：构造函数初值与 `updateUiScaleForCurrentDisplay()`。
+
+### 6. 关键代码位置
+
+| 功能 | 位置 |
+|---|---|
+| 三槽枚举 / 布局存取 | `PluginProcessor.h` `LayoutSlot`；`PluginProcessor.cpp` `get/setStateInformation`、`get/setSavedLayoutXml` |
+| Stick 会话字段 | `PluginProcessor.h` `savedStick*` |
+| 活动槽 / 统一写盘 | `PluginEditor.cpp` `activeLayoutSlot()` / `persistCurrentLayoutToProcessor()` |
+| 启动恢复 Stick | `PluginEditor.cpp` `restoreSavedStickSession()` / `loadSavedStickSlotLayout()` |
+| 浮动记录存档 | `ModuleWorkspace.cpp` `saveFloatingModulesTree()` / `loadFloatingModulesFromTree()` |
+| 旧格式迁移 | `ModuleWorkspace.cpp` `loadLayoutFromTree()` 的 `importLegacyFloating` 分支；`PluginProcessor.cpp` 读盘迁移 |
+| 菜单约束覆盖 | `third_party/JUCE/modules/juce_gui_basics/menus/juce_PopupMenu.{h,cpp}` |
+| ComboBox 菜单 | `PinkXPStyle.cpp` `getOptionsForComboBoxPopupMenu()` |
+| 添加模块菜单 | `ModuleWorkspace.cpp` `showAddMenu()` |
+| UI 缩放平台判据 | `PluginEditor.cpp` `resolveUiScaleArea()` |
+
+### 7. 测试清单
+
+**布局与 Stick**
+
+1. 普通态调整布局 → 进入 Stick(T) → 调条高/模块 → 退出 → 普通布局逐像素恢复；
+2. T/B 来回切换，两侧布局与条高互不覆盖；
+3. Stick 中重启软件 → 自动恢复上次的边、条高、布局；
+4. 插件宿主（VST3/AU）中不出现 Stick 按钮。
+
+**浮动模块**
+
+1. 普通态弹出模块 → 进入 Stick → 浮动窗口保持 → 退出 → 仍在；
+2. Stick 中删除浮动模块 → 退出 Stick → 再进入 → 不复活；重启 → 不复活；
+3. 普通态删除浮动模块 → 进入 Stick → 不复活；
+4. Stick 中弹出新模块 → 退出 Stick → 仍以浮动窗口存在；
+5. 重启（普通态 / Stick 态）后，浮动窗口位置、尺寸、模块业务状态恢复。
+
+**菜单**
+
+1. Stick(T)/(B) 下展开预设下拉，菜单贴着下拉框、可覆盖条带；
+2. Stick 态右键"添加模块"，菜单贴着点击位置；
+3. 浮动窗口内的下拉菜单行为与普通窗口一致。
+
+**跨平台**
+
+1. macOS 构建不再依赖 `withParentAreaOverride`（可用官方 JUCE）；
+2. macOS UI 缩放档位不因本轮改动变化；
+3. macOS Standalone 的浮动模块可跨重启恢复。
+
+### 8. 已知边界
+
+1. **在 Stick 里把浮动模块停靠回条状画布**：该模块只进入当前 Stick 槽；退出 Stick 后普通布局里没有它（三槽是独立布局空间）。
+2. **旧 Stick 槽里的 floating 记录被刻意忽略**：升级时只从 normal 槽迁移浮动模块；仅在 Stick 槽里出现过的历史浮动记录不会恢复。
+3. 布局槽按形态独立：在 Stick 中新增/删除 canvas 模块，只影响当前 Stick 槽，不会同步到普通槽。
+4. `third_party/JUCE` 的 `withParentAreaOverride` 是仓库内本地扩展，升级 JUCE 时需要重新应用。
+
+### 9. 版本与构建
+
+- 版本：2.8.5 → **2.8.6**（`CMakeLists.txt` 三处、`Y2Kmeter_installer.iss`、`README.md`、`PluginEditor.cpp` 四处字面量）；
+- Windows 构建：`cmake --build build/msvc --config Release --target Y2Kmeter_Standalone -j 8`（VST3 / milkdrop VST3 同理）；
+- 安装包：`dist/Y2Kmeter_Setup_2.8.6_x64.exe`；
+- **踩坑**：只改版本号后增量构建不会重写 JUCE 生成的 `*_resources.rc`，EXE/VST3 版本信息仍是旧值；需删除 `build/msvc/*/JuceLibraryCode/*_resources.rc` 后重新构建（或重新 configure）。
 
 ---
 
