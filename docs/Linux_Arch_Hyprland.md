@@ -252,8 +252,22 @@ pw-play /path/to/tone.wav
 
 1. **Milkdrop**：需要系统安装 libprojectM 4.x（Arch: `sudo pacman -S libprojectm`），
    运行时通过 `dlopen("libprojectM-4.so.4")` 加载；也可把 `libprojectM-4.so`
-   放到可执行文件同目录。预设/纹理放在 `~/.local/share/Y2Kmeter/`，安装脚本
-   会自动从仓库 seed。
+   放到可执行文件同目录。
+
+   **预设/纹理来源**：仓库本身自带 `assets/milkdrop_presets/`（9921 个 `.milk`）
+   与 `assets/milkdrop_textures/`（66 个纹理），另外还各有一份同名 `.zip`。
+   Linux 运行时**不直接读仓库目录**，而是读用户数据目录：
+   `~/.local/share/Y2Kmeter/milkdrop_presets` 与 `.../milkdrop_textures`。
+   `scripts/linux_install.sh` 会按"目录 → zip"的优先级把资源 seed 过去并打印数量；
+   目标目录已存在且非空时跳过（不覆盖用户自己增删的预设）。
+
+   **如果只手动拷贝了二进制、没有 seed 资源**：Milkdrop 模块本身仍能创建，
+   但预设列表为空/只能显示默认画面 —— 这不是预设"丢失"，而是资源目录没建立。
+   重新跑一次安装脚本，或手动执行：
+   ```bash
+   mkdir -p ~/.local/share/Y2Kmeter
+   cp -r assets/milkdrop_presets assets/milkdrop_textures ~/.local/share/Y2Kmeter/
+   ```
 2. **Stick 不是真占位**：见 4.3，属于 Wayland 平台能力差异。
 3. **多显示器/混合缩放**：坐标换算按"窗口所在显示器的 scale"算；多显示器
    各自不同缩放组合未做过实机验证。

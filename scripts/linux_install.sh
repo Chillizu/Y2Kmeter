@@ -33,17 +33,52 @@ install -Dm755 "$BIN" "$PREFIX/Y2Kmeter"
 
 echo "[2/4] seed Milkdrop 资源 -> $DATA_DIR"
 mkdir -p "$DATA_DIR"
-for sub in milkdrop_presets milkdrop_textures; do
-  src="$REPO_DIR/assets/$sub"
-  dst="$DATA_DIR/$sub"
+
+# 资源来源优先级：
+#   1) 仓库里的 assets/<sub>/（git clone 自带 9921 个 .milk + 66 个纹理）
+#   2) assets/<sub>.zip（部分分发方式只带 zip）
+# 目标已存在且非空则跳过，避免每次安装都覆盖用户自己增删的预设。
+seed_assets() {
+  local sub="$1"
+  local src="$REPO_DIR/assets/$sub"
+  local zip="$REPO_DIR/assets/$sub.zip"
+  local dst="$DATA_DIR/$sub"
+
   if [[ -d "$dst" ]] && [[ -n "$(ls -A "$dst" 2>/dev/null || true)" ]]; then
-    echo "      已存在，跳过：$dst"
-  elif [[ -d "$src" ]]; then
-    cp -r "$src" "$dst"
-    echo "      已复制：$sub"
-  else
-    echo "      [WARN] 仓库里缺少 assets/$sub，跳过"
+    local existing
+    existing=$(find "$dst" -maxdepth 1 -name '*.milk' 2>/dev/null | wc -l)
+    if [[ "$sub" == "milkdrop_textures" ]]; then
+      existing=$(find "$dst" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    fi
+    echo "      已存在，跳过：$dst（$existing 项）"
+    return
   fi
+
+  if [[ -d "$src" ]]; then
+    cp -r "$src" "$dst"
+    echo "      已复制目录：assets/$sub"
+  elif [[ -f "$zip" ]] && command -v unzip >/dev/null 2>&1; then
+    mkdir -p "$dst"
+    unzip -q "$zip" -d "$dst"
+    echo "      已解压：assets/$sub.zip"
+  else
+    echo "      [WARN] 找不到 assets/$sub 或 assets/$sub.zip（且无 unzip），Milkdrop 将没有可用预设"
+    return
+  fi
+
+  local got
+  if [[ "$sub" == "milkdrop_presets" ]]; then
+    got=$(find "$dst" -maxdepth 1 -name '*.milk' 2>/dev/null | wc -l)
+    echo "      预设数量：$got 个 .milk"
+    [[ "$got" -gt 0 ]] || echo "      [WARN] 预设目录为空，Milkdrop 模块会没有预设可切换"
+  else
+    got=$(find "$dst" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    echo "      纹理数量：$got 个文件"
+  fi
+}
+
+for sub in milkdrop_presets milkdrop_textures; do
+  seed_assets "$sub"
 done
 
 echo "[3/4] 启动入口"
