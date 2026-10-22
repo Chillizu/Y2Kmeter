@@ -116,12 +116,26 @@ install -Dm755 build/linux/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter \
 4. 成功后重新提交期望几何，并用 `hyprctl` 把窗口搬到目标位置。
 
 平铺式 WM 的兜底：非 Hyprland 环境不会做任何 IPC 调用，若仍被平铺，可在
-合成器配置里加窗口规则（Hyprland 示例）：
+合成器配置里加窗口规则。
+
+Hyprland ≥ 0.55（Lua 配置，推荐，双保险 + 禁用合成器圆角）：
+
+```lua
+-- ~/.config/hypr/custom/rules.lua 之类的用户配置里
+hl.window_rule({ match = { class = "^(Y2Kmeter)$" }, float = true, rounding = 0 })
+```
+
+Hyprland < 0.55（hyprlang）：
 
 ```ini
 windowrulev2 = float, class:^(Y2Kmeter)$
-windowrulev2 = pin, class:^(Y2Kmeter)$
+windowrulev2 = rounding 0, class:^(Y2Kmeter)$
 ```
+
+> `float` 规则的作用：应用启动时会自己 `hyprctl` 转 floating，但用户执行
+> `hyprctl reload` 或重启合成器后，dispatch 设置的浮动状态可能被规则重算覆盖；
+> 有这条规则兜底后，Y2Kmeter 始终保持浮动。`rounding = 0` 只对 Y2Kmeter 生效，
+> 因为它的像素 UI 不需要合成器圆角。
 
 ### 4.3 Stick（驻留条）
 
@@ -136,10 +150,16 @@ Linux 上 Stick 走"浮动条贴边"：
 
 ### 4.4 窗口 bounds 的恢复策略
 
-- 存档里若出现"等于整屏尺寸"的窗口（Windows 时代的伪最大化残留），Linux 上
-  不再照搬，而是缩到显示器 `userArea` 的 80% 并居中 —— 避免一启动就是一块
-  盖满桌面、无法拖动的窗口。
-- 关闭时仍按"Show 态等效尺寸"保存，语义与上游一致。
+- 忠实恢复存档里的窗口尺寸/位置（包括"整屏尺寸"）：但恢复出来的是 **floating**
+  窗口，可随时拖动/缩放，不再是"被平铺锁死、盖满桌面动不了"的状态。
+- 若存档尺寸超出当前显示器 `userArea`（例如换了更小的屏），才会被夹到
+  `userArea` 内。
+- Linux Standalone 的缩放上限放宽到 8192×8192（原来是 1600×1100），用户想
+  拉满 2560×1600 全屏不会被尺寸上限卡住。
+- 恢复时使用 `addToDesktop()` **之前** 记录的期望 bounds：Hyprland 的 float
+  规则会在窗口 map 时重新决定浮动窗尺寸，如果用 map 之后的 bounds 再提交一次，
+  会把合成器给的尺寸固化下来。
+- 关闭时按"Show 态等效尺寸"保存，语义与上游一致。
 
 ### 4.5 文件对话框层级
 

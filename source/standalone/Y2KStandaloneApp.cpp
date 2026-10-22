@@ -692,15 +692,24 @@ public:
         //
         //    chromeVisible 恢复通过 callAsync 延迟：setChromeVisible 内部依赖
         //    editor.isShowing() 和 canResizeWindow 的标准路径，必须在窗口可见后执行。
+#if JUCE_LINUX
+        const auto intendedWindowBounds = mainWindow->getBounds();
+#endif
+
         mainWindow->addToDesktop();
         mainWindow->setVisible(true);
 
 #if JUCE_LINUX
+        // 注意：desired bounds 必须在 addToDesktop/setVisible 之前取。
+        //   Hyprland 的 float 规则会在窗口 map 时重新决定浮动窗尺寸，JUCE 收到
+        //   ConfigureNotify 后会把 Component bounds 改成合成器给的值；如果这里
+        //   再用 setVisible 之后的 getBounds() 去"重新提交几何"，就会把被缩小
+        //   后的尺寸固化下来。用 map 前记录的期望值才是用户存档里的真实意图。
         // Hyprland 等平铺式合成器会把新窗口直接塞进平铺布局（表现为窗口被拉满
         // 屏幕、无法拖动、对话框被压在下面）。窗口上屏后把它转成浮动窗口并提到
         // 最前，然后重新提交一次期望几何。窗口刚映射时 Hyprland 可能还没把它登记
         // 进 clients 列表，所以用有限次异步重试。非 Hyprland 环境是 no-op。
-        tryAdoptLinuxWindow (mainWindow->getBounds(), 0);
+        tryAdoptLinuxWindow (intendedWindowBounds, 0);
 #endif
 
         if (cachedEditor != nullptr)
@@ -984,35 +993,6 @@ private:
                 }
             }
         }
-
-#if JUCE_LINUX
-        // Linux/Hyprland：Windows 时代的存档里可能留下"整屏尺寸"的窗口
-        //   （伪最大化 / AppBar 驻留残留）。在浮动窗口模型下恢复成整屏尺寸会
-        //   立刻盖住整个桌面且无法拖动，这里判定为无效，回退到默认条状尺寸。
-        {
-            const juce::Displays::Display* best = nullptr;
-            int bestArea = -1;
-            for (const auto& d : disp.displays)
-            {
-                const auto inter = d.userArea.getIntersection (target);
-                const int a = inter.getWidth() * inter.getHeight();
-                if (a > bestArea) { bestArea = a; best = &d; }
-            }
-            if (best != nullptr)
-            {
-                const auto ua = best->userArea;
-                if (target.getWidth()  >= ua.getWidth()  - 2
-                    && target.getHeight() >= ua.getHeight() - 2)
-                {
-                    // 整屏尺寸 → 缩到 userArea 的 80% 并居中：保留原布局比例，
-                    //   同时让窗口成为可拖动/可缩放、不遮挡整块桌面的浮动窗。
-                    const int tw = juce::jmax (640, juce::roundToInt (ua.getWidth()  * 0.8f));
-                    const int th = juce::jmax (420, juce::roundToInt (ua.getHeight() * 0.8f));
-                    target = { ua.getCentreX() - tw / 2, ua.getCentreY() - th / 2, tw, th };
-                }
-            }
-        }
-#endif
 
         mainWindow->setBounds (target);
         return true;

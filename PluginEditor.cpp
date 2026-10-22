@@ -1264,6 +1264,13 @@ Y2KmeterAudioProcessorEditor::Y2KmeterAudioProcessorEditor(Y2KmeterAudioProcesso
     setResizable(true, true);
     if (isPluginHost)
         setResizeLimits(50, 50, 8192, 8192);
+   #if JUCE_LINUX
+    // Linux/桌面场景：窗口由用户自己在合成器里拖拽缩放，可能希望铺满整块
+    //   显示器（HiDPI 下 2560×1600 很常见）。把上限放到 8192，避免用户想拉大
+    //   到全屏时被 1600×1100 的上限卡住。
+    else if (juce::JUCEApplicationBase::isStandaloneApp())
+        setResizeLimits(640, 420, 8192, 8192);
+   #endif
     else
         setResizeLimits(640, 420, 1600, 1100);
 
