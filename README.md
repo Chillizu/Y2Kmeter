@@ -92,9 +92,11 @@ cmake --build --preset linux-release --target Y2Kmeter_Standalone
 # 产物：build/linux/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter
 ```
 
-Linux 适配细节（Hyprland 浮动/驻留条、PipeWire 系统输出采集、已知限制）见
-[`docs/Linux_Arch_Hyprland.md`](docs/Linux_Arch_Hyprland.md)。Milkdrop 模块在 Linux 上
-暂不可用（仓库只带 Windows/macOS 版 libprojectM 二进制）。
+Linux 适配细节（Hyprland 浮动/驻留条、PipeWire 系统输出采集、Milkdrop、已知限制）见
+[`docs/Linux_Arch_Hyprland.md`](docs/Linux_Arch_Hyprland.md)。
+
+- 一键安装（二进制 + Milkdrop 资源 + 启动项）：`scripts/linux_install.sh`
+- Milkdrop 需要 libprojectM 4.x：`sudo pacman -S libprojectm`（Arch）
 
 ---
 

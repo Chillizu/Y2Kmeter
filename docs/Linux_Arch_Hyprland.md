@@ -19,7 +19,7 @@
 | 系统输出（Output 源） | 支持 | 采集默认 sink 的 monitor（`pw-record`；PulseAudio 回退 `parec`） |
 | 麦克风（Microphone 源） | 支持 | 走 JUCE ALSA 设备 |
 | 预设 Save / Load（.settings） | 支持 | 原生对话框走 zenity/kdialog；失败会弹错误提示 |
-| Milkdrop 模块 | 不可用 | 仓库只带 Windows DLL / macOS dylib，Linux 无 libprojectM |
+| Milkdrop 模块 | 支持（需 libprojectM 4.x） | 运行时 dlopen `libprojectM-4.so`，预设/纹理从 `~/.local/share/Y2Kmeter/` 读取 |
 
 ---
 
@@ -33,6 +33,9 @@ sudo pacman -S --needed base-devel cmake ninja gcc ccache \
     libx11 libxrandr libxinerama libxcursor libxext \
     pipewire pipewire-pulse wireplumber \
     zenity        # 文件对话框（非必需：缺省时回退 JUCE 自绘对话框）
+
+# 可选：Milkdrop 模块需要 libprojectM 4.x
+sudo pacman -S --needed libprojectm
 ```
 
 说明：
@@ -66,12 +69,16 @@ cmake --build build/linux --target Y2Kmeter_Standalone -j"$(nproc)"
 # 直接运行
 ./build/linux/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter
 
-# 安装到用户目录（可选）
-install -Dm755 build/linux/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter \
-    ~/.local/opt/Y2Kmeter/Y2Kmeter
+# 安装到用户目录（推荐用脚本：会一并 seed Milkdrop 资源 + 建启动项）
+scripts/linux_install.sh
+# 等价于：
+#   install -Dm755 build/linux/Y2Kmeter_artefacts/Release/Standalone/Y2Kmeter ~/.local/opt/Y2Kmeter/Y2Kmeter
+#   cp -r assets/milkdrop_presets assets/milkdrop_textures ~/.local/share/Y2Kmeter/
 ```
 
-应用配置文件：`~/.config/Y2Kmeter.settings`（JUCE `PropertiesFile`）。
+应用配置：`~/.config/Y2Kmeter.settings`；Milkdrop 资源：`~/.local/share/Y2Kmeter/milkdrop_presets|milkdrop_textures`。
+
+
 
 ---
 
@@ -189,15 +196,23 @@ JUCE 的 **ALSA 输入设备列表**里按关键词（blackhole/loopback/monitor
 
 新增 `source/standalone/LinuxMonitorCapture.{h,cpp}`（零 JUCE 依赖）：
 
-- **PipeWire（主路径）**：`pw-record --target <default-sink>.monitor --format f32
-  --rate 48000 --channels 2 --container raw -`；
-- **PulseAudio（回退）**：`parec --device=<default-sink>.monitor --format=float32le
-  --rate=48000 --channels=2 --raw`；
+- **PipeWire（主路径）**：
+  `pw-record --target <sink-node-name> -P stream.capture.sink=true --format f32 --rate 48000 --channels 2 --container raw -`
+- **PulseAudio（回退）**：
+  `parec --device=<sink>.monitor --format=float32le --rate=48000 --channels=2 --raw`
 - 默认 sink 的解析顺序：`pactl get-default-sink` → `wpctl inspect
   @DEFAULT_AUDIO_SINK@` → `pw-metadata` → `pw-dump`，逐级兜底；
+- 启动后用 `pactl list short source-outputs` 交叉校验：新流必须绑定到
+  `<sink>.monitor` 源，否则直接失败（不允许把麦克风静默当成系统输出）；
 - 采集线程按 10ms（480 帧）分块，interleaved → L/R 平面 float 回调；
 - 与 Windows loopback 相同的并发约束：启动前 `detachHolderCallback()`，
   停止后 `attachHolderCallback()`，保证同一时刻只有一路在写 `AnalyserHub`。
+
+> **关键坑**：`<sink>.monitor` 只是 pulse 兼容层的虚拟源名字，**不是原生
+> PipeWire 节点**。直接 `pw-record --target <sink>.monitor` 时 pw-record 解析
+> 不到目标会**静默回退到默认 source（麦克风）**，不报任何错 —— 表现就是
+> “Output 里混进了麦克风声音；静音麦克风后 Output 完全没声音”。
+> 正确写法是 target 用 sink 的 node name 并显式 `stream.capture.sink=true`。
 
 切换语义与上游一致：下拉里仍只有 `Microphone` / `Output` 两项，
 `Output` 现在直接抓系统混音输出，不需要 BlackHole/VB-Cable 之类的虚拟声卡。
@@ -215,11 +230,12 @@ pw-play /path/to/tone.wav
 
 - `pw-record` 不加 `--container raw` 会在 stdout 前带 24 字节 AU 头，导致
   f32 流整体错位；实现里已固定加该参数；
-- `pw-record --target <不存在的名字>` 不报错，会静默回退到默认 source
-  （即麦克风）。如果 Output 表跟着环境噪音而不是系统播放声跳动，先检查
-  `pactl get-default-sink` 与 `.monitor` 名字；
-- 部分发行版的 `parec`（PipeWire 1.6.x）连上后不出数据；实现会以 1.5s
-  超时返回失败并回退麦克风，主路径务必保证 `pw-record` 可用。
+- `<sink>.monitor` 不能直接当 `pw-record --target`，会静默回退麦克风
+  （见 5.2 的关键坑）；现在实现会交叉校验绑定目标并报错；
+- `parec` 的 stdout 有缓冲，外部 `timeout`/SIGTERM 杀掉时可能一行都没写出；
+  这是测试脚本的假象，不是采集失败。应用内部走管道实时读，不受影响；
+- 若把某个应用的录音流手动在 mixer 里改到别的 source，会与实现抢占；
+  Y2Kmeter 每次切换 Output 都会重新建立自己的采集流。
 
 ---
 
@@ -234,9 +250,10 @@ pw-play /path/to/tone.wav
 
 ## 七、已知限制 / 后续可做
 
-1. **Milkdrop**：Linux 缺 libprojectM 二进制。要启用需自行编译 libprojectM 4
-   并把 `libprojectM-4.so` 放到可执行文件旁，同时把 `ProjectMApi.cpp` 的
-   dlopen 路径分支补上 Linux（目前只找 `.dll` / `.dylib`）。
+1. **Milkdrop**：需要系统安装 libprojectM 4.x（Arch: `sudo pacman -S libprojectm`），
+   运行时通过 `dlopen("libprojectM-4.so.4")` 加载；也可把 `libprojectM-4.so`
+   放到可执行文件同目录。预设/纹理放在 `~/.local/share/Y2Kmeter/`，安装脚本
+   会自动从仓库 seed。
 2. **Stick 不是真占位**：见 4.3，属于 Wayland 平台能力差异。
 3. **多显示器/混合缩放**：坐标换算按"窗口所在显示器的 scale"算；多显示器
    各自不同缩放组合未做过实机验证。
@@ -253,6 +270,7 @@ pw-play /path/to/tone.wav
 
 - `source/standalone/LinuxWindowSupport.{h,cpp}` —— Hyprland 浮动/置顶/移动
 - `source/standalone/LinuxMonitorCapture.{h,cpp}` —— 系统输出采集
+- `scripts/linux_install.sh` —— 安装二进制 + seed Milkdrop 资源 + 启动项
 
 修改：
 
@@ -264,3 +282,5 @@ pw-play /path/to/tone.wav
 - `PluginEditor.{h,cpp}` —— Linux 窗口几何抽象、Stick 启用、对话框置顶挂起
 - `source/ui/ModuleWorkspace.{h,cpp}` —— Linux 下显示 Stick 按钮、Save 对话框
   parent 与打开/关闭通知、拼写与注释
+- `source/ui/modules/ProjectMApi.cpp` —— Linux dlopen `libprojectM-4.so` 分支
+- `source/ui/modules/MilkdropModule.cpp` —— Linux 优先从 `~/.local/share` 读资源

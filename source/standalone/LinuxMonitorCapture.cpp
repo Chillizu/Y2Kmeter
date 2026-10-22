@@ -34,6 +34,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -354,12 +355,13 @@ namespace detail
         return name;
     }
 
-    // 顺序：pactl get-default-sink → wpctl inspect → pw-metadata → pw-dump
-    // shouldStop 用于在逐级兜底时尽快响应 stop()，避免长时间卡在查询命令上。
-    bool resolvePipeWireMonitor (std::string& monitor, std::string& error,
-                                 const std::atomic<bool>& shouldStop)
+    // 解析默认 sink 的 **node name**（不是 <sink>.monitor）。
+    //   order: pactl get-default-sink → wpctl inspect → pw-metadata → pw-dump
+    //   shouldStop 用于在逐级兜底时尽快响应 stop()，避免长时间卡在查询命令上。
+    bool resolvePipeWireSink (std::string& sinkName, std::string& error,
+                              const std::atomic<bool>& shouldStop)
     {
-        monitor.clear();
+        sinkName.clear();
         std::string out;
 
         const auto cancelled = [&shouldStop]
@@ -376,7 +378,7 @@ namespace detail
             const std::string sink = sanitizeNodeName (out);
             if (! sink.empty())
             {
-                monitor = sink + ".monitor";
+                sinkName = sink;
                 return true;
             }
         }
@@ -390,7 +392,7 @@ namespace detail
             const std::string name = sanitizeNodeName (parseNodeNameFromWpctl (out));
             if (! name.empty())
             {
-                monitor = name + ".monitor";
+                sinkName = name;
                 return true;
             }
         }
@@ -404,7 +406,7 @@ namespace detail
             const std::string name = sanitizeNodeName (parseDefaultAudioSinkName (out));
             if (! name.empty())
             {
-                monitor = name + ".monitor";
+                sinkName = name;
                 return true;
             }
         }
@@ -418,12 +420,12 @@ namespace detail
             const std::string name = sanitizeNodeName (parseDefaultAudioSinkName (out));
             if (! name.empty())
             {
-                monitor = name + ".monitor";
+                sinkName = name;
                 return true;
             }
         }
 
-        error = "Could not determine the default PipeWire sink monitor "
+        error = "Could not determine the default PipeWire sink "
                 "(pactl get-default-sink, wpctl inspect @DEFAULT_AUDIO_SINK@, "
                 "pw-metadata and pw-dump all failed).";
         return false;
@@ -454,6 +456,125 @@ namespace detail
 
         monitor = "@DEFAULT_MONITOR@";
         return true;
+    }
+
+    // ---------------- 采集目标校验 ----------------
+    // 为什么要校验：
+    //   `pw-record --target <name>` 在目标名字解析失败时会**静默回退到默认
+    //   source（麦克风）**，不报任何错。旧实现把 "<sink>.monitor" 当 target
+    //   传进去，但 monitor 不是原生 PipeWire node（只是 pulse 兼容层虚拟源），
+    //   于是一直在偷偷录麦克风。现在改为 target=<sink node name> +
+    //   `-P stream.capture.sink=true`（PipeWire 正确抓取 sink monitor 的方式），
+    //   并在首个音频块到达时用 pactl 交叉验证实际绑定的 source。
+    bool listPactlShort (const std::string& object,
+                         std::vector<std::vector<std::string>>& rows)
+    {
+        rows.clear();
+        const std::string pactl = findExecutable ("pactl");
+        if (pactl.empty())
+            return false;
+
+        std::string out;
+        if (! runCommand ({ pactl, "list", "short", object }, out))
+            return false;
+
+        auto pushLine = [&rows] (const std::string& line)
+        {
+            if (line.empty())
+                return;
+            std::vector<std::string> fields;
+            std::string cur;
+            for (char c : line)
+            {
+                if (c == '\t') { fields.push_back (cur); cur.clear(); }
+                else            { cur.push_back (c); }
+            }
+            fields.push_back (cur);
+            rows.push_back (std::move (fields));
+        };
+
+        std::string line;
+        for (char c : out)
+        {
+            if (c == '\n') { pushLine (line); line.clear(); }
+            else            { line.push_back (c); }
+        }
+        pushLine (line);
+        return true;
+    }
+
+    int parseIntField (const std::string& s)
+    {
+        if (s.empty() || s.size() > 9)
+            return -1;
+        for (char c : s)
+            if (c < '0' || c > '9')
+                return -1;
+        return std::atoi (s.c_str());
+    }
+
+    // pulse 源名字 → source index；找不到返回 -1（-1 时后续校验会跳过）。
+    int lookupMonitorSourceIndex (const std::string& monitorName)
+    {
+        std::vector<std::vector<std::string>> rows;
+        if (! listPactlShort ("sources", rows))
+            return -1;
+
+        for (const auto& f : rows)
+            if (f.size() >= 2 && f[1] == monitorName)
+                return parseIntField (f[0]);
+
+        return -1;
+    }
+
+    std::set<int> snapshotSourceOutputIndices()
+    {
+        std::set<int> ids;
+        std::vector<std::vector<std::string>> rows;
+        if (! listPactlShort ("source-outputs", rows))
+            return ids;
+
+        for (const auto& f : rows)
+        {
+            const int id = parseIntField (f.empty() ? std::string() : f[0]);
+            if (id >= 0)
+                ids.insert (id);
+        }
+        return ids;
+    }
+
+    // 返回值：1 = 绑定到 monitor；0 = 绑定到了别的源（写 error）；-1 = 无法校验。
+    int verifyCaptureBoundToMonitor (const std::set<int>& before,
+                                     int monitorSourceIndex,
+                                     std::string& error)
+    {
+        if (monitorSourceIndex < 0)
+            return -1;
+
+        std::vector<std::vector<std::string>> rows;
+        if (! listPactlShort ("source-outputs", rows))
+            return -1;
+
+        for (const auto& f : rows)
+        {
+            if (f.size() < 2)
+                continue;
+
+            const int id = parseIntField (f[0]);
+            if (id < 0 || before.count (id) != 0)
+                continue;
+
+            const int sourceIndex = parseIntField (f[1]);
+            if (sourceIndex == monitorSourceIndex)
+                return 1;
+
+            error = "capture bound to source index " + std::to_string (sourceIndex)
+                  + " instead of the sink monitor (index "
+                  + std::to_string (monitorSourceIndex) + ")";
+            return 0;
+        }
+
+        return -1;
     }
 
     // ---------------- 子进程启动/回收 ----------------
@@ -808,23 +929,31 @@ void LinuxMonitorCapture::runCaptureThread()
     std::string program;                 // 仅用于错误信息
     std::vector<std::string> argv;
 
+    std::string verifyMonitorName;   // 用于启动后校验实际绑定的 monitor 源
+
     if (! pwRecordPath.empty())
     {
-        std::string monitor;
+        std::string sinkName;
         std::string resolveError;
-        if (! detail::resolvePipeWireMonitor (monitor, resolveError,
-                                             shouldStop))
+        if (! detail::resolvePipeWireSink (sinkName, resolveError,
+                                           shouldStop))
         {
             if (! shouldStop.load (std::memory_order_acquire))
                 lastError = resolveError.empty()
-                              ? "Could not determine the default PipeWire sink monitor."
+                              ? "Could not determine the default PipeWire sink."
                               : resolveError;
             return;
         }
 
+        // ★ 关键：target 必须是 sink 的 node name（原生节点），并显式要求
+        //   capture sink。不能传 "<sink>.monitor" —— 那只是 pulse 兼容层的
+        //   虚拟源名字，pw-record 解析不到会静默回退到默认麦克风。
+        verifyMonitorName = sinkName + ".monitor";
+
         program = "pw-record";
         argv = { pwRecordPath,
-                 "--target", monitor,
+                 "--target", sinkName,
+                 "-P", "stream.capture.sink=true",
                  "--format", "f32",
                  "--rate", "48000",
                  "--channels", "2",
@@ -860,6 +989,13 @@ void LinuxMonitorCapture::runCaptureThread()
         return;
 
     // ---- 2. 启动子进程 ----
+    //   启动前记录已有 source-output 快照 + monitor 的 pulse 源 index，
+    //   首个音频块到达后用 pactl 交叉校验实际绑定目标（防静默回退麦克风）。
+    const int monitorSourceIndex = verifyMonitorName.empty()
+                                     ? -1
+                                     : detail::lookupMonitorSourceIndex (verifyMonitorName);
+    const auto sourceOutputsBefore = detail::snapshotSourceOutputIndices();
+
     int audioFd = -1;
     int stderrFd = -1;
     pid_t child = -1;
@@ -926,6 +1062,21 @@ void LinuxMonitorCapture::runCaptureThread()
 
                     if (! firstBlockDelivered)
                     {
+                        // 校验采集目标：如果 pw-record 回退到了麦克风，宁可报错
+                        // 也不能把麦克风静默当成"系统输出"喂给分析链路。
+                        std::string verifyError;
+                        const int ok = detail::verifyCaptureBoundToMonitor (
+                                            sourceOutputsBefore, monitorSourceIndex,
+                                            verifyError);
+
+                        if (ok == 0)
+                        {
+                            lastError = "System output capture mis-targeted: "
+                                      + verifyError
+                                      + ". Check PipeWire >= 0.3.x and retry.";
+                            break;
+                        }
+
                         firstBlockDelivered = true;
                         running.store (true, std::memory_order_release);
                     }
